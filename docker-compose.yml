@@ -1,0 +1,16 @@
+services:
+  litecourse-cloud:
+    build: .
+    container_name: litecourse-cloud
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:8787"
+    environment:
+      PORT: "8787"
+      ACCESS_CODE: "${ACCESS_CODE:-change-me-access-code}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-change-me-32-chars-encryption-key!!}"
+      DATA_DIR: "/app/data"
+      SEMESTER_START_MONDAY: "${SEMESTER_START_MONDAY:-2026-09-07}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    volumes:
+      - ./data:/app/data
