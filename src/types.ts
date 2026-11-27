@@ -63,6 +63,25 @@ export interface AccountDeviceInfo {
   [key: string]: unknown;
 }
 
+export interface AccountConfigPayload {
+  semesterStartMonday?: string | null;
+  timetable: TimetableCourse[];
+  reservations: SignReservation[];
+  courseLocations?: Record<string, CourseLocationPreset>;
+  aiConfig?: AiConfig | null;
+}
+
+export interface BoundDeviceInfo {
+  deviceId: string;
+  deviceName: string;
+  platformOs: string;
+  isTablet: boolean;
+  boundAt: string;
+  lastSeenAt: string;
+  lastSeenMs: number;
+  isCurrentDevice?: boolean;
+}
+
 export interface AccountSyncItem {
   /** Composite isolated key: e.g. rc:yuketang_123456 or cx:987654 */
   accountKey: string;
@@ -74,6 +93,7 @@ export interface AccountSyncItem {
   name: string;
   /** Full cookie header string or serialized cookie map */
   cookies: Record<string, string> | string;
+  cookiesUpdatedAt?: number;
   deviceInfo?: AccountDeviceInfo | null;
   semesterStartMonday?: string | null;
   timetable: TimetableCourse[];
@@ -84,22 +104,70 @@ export interface AccountSyncItem {
 
 export interface CloudSyncRequest {
   accounts: AccountSyncItem[];
+  deviceName?: string;
+  platformOs?: string;
+  isTablet?: boolean;
+}
+
+export interface PullAccountInput {
+  accountKey: string;
+  platform: PlatformType;
+  server?: RainClassroomServerType;
+  uid: string;
+  name: string;
+  knownRev?: number;
+  cookies?: Record<string, string> | string;
+  cookiesUpdatedAt?: number;
+  deviceInfo?: AccountDeviceInfo | null;
+  /** Only used to seed cloud when this accountKey does NOT exist yet */
+  initialConfig?: AccountConfigPayload | null;
+}
+
+export interface PullSyncRequest {
+  deviceName?: string;
+  platformOs?: string;
+  isTablet?: boolean;
+  logLimit?: number;
+  accounts: PullAccountInput[];
+}
+
+export interface PushAccountConfigRequest {
+  deviceName?: string;
+  platformOs?: string;
+  isTablet?: boolean;
+  platform: PlatformType;
+  server?: RainClassroomServerType;
+  uid: string;
+  name: string;
+  baseRev?: number;
+  cookies?: Record<string, string> | string;
+  cookiesUpdatedAt?: number;
+  deviceInfo?: AccountDeviceInfo | null;
+  semesterStartMonday?: string | null;
+  timetable: TimetableCourse[];
+  reservations: SignReservation[];
+  courseLocations?: Record<string, CourseLocationPreset>;
+  aiConfig?: AiConfig | null;
+  allowClearApiKey?: boolean;
 }
 
 export interface StoredAccount {
-  userToken: string;
   accountKey: string;
   platform: PlatformType;
   server: RainClassroomServerType;
   uid: string;
   name: string;
   cookies: Record<string, string>;
+  cookiesUpdatedAt: number;
   deviceInfo: AccountDeviceInfo;
   semesterStartMonday: string | null;
   timetable: TimetableCourse[];
   reservations: SignReservation[];
   courseLocations: Record<string, CourseLocationPreset>;
   aiConfig: AiConfig | null;
+  configRev: number;
+  configUpdatedAt: string;
+  lastEditorDeviceId: string;
   sessionStatus: AccountSessionStatus;
   sessionError: string;
   updatedAt: string;
@@ -117,7 +185,6 @@ export type LogSeverity = 'info' | 'success' | 'warn' | 'error';
 
 export interface ExecutionLogItem {
   id: number;
-  userToken: string;
   accountKey: string;
   accountName: string;
   platform: PlatformType | 'system';
@@ -133,7 +200,6 @@ export interface ExecutionLogItem {
 
 export interface ActiveSessionSnapshot {
   sessionKey: string;
-  userToken: string;
   accountKey: string;
   accountName: string;
   lessonId: string;
@@ -147,6 +213,13 @@ export interface ActiveSessionSnapshot {
   pendingCount: number;
   startedAt: string;
   lastActivityAt: string;
+}
+
+export interface OwnershipVerifyResult {
+  ok: boolean;
+  expired?: boolean;
+  actualUid?: string;
+  reason?: string;
 }
 
 export interface OnlineCourse {

@@ -24,7 +24,6 @@ import {
 
 interface InternalLessonSession {
   sessionKey: string;
-  userToken: string;
   accountKey: string;
   accountName: string;
   lessonId: string;
@@ -41,7 +40,7 @@ interface InternalLessonSession {
   reconnectAttempts: number;
   reconnectTimer: NodeJS.Timeout | null;
   healthTimer: NodeJS.Timeout | null;
-  delayTimers: Map<string, NodeJS.Timeout>;
+  delayTimers: Map<string, () => void>;
   inFlightProblemIds: Set<string>;
   problemUnlockedAt: Map<string, number>;
   problemLimits: Map<string, number>;
@@ -78,31 +77,19 @@ export class RcAutoAnswerEngine {
     private readonly logger: Logger
   ) {}
 
-  static buildSessionKey(
-    userToken: string,
-    accountKey: string,
-    lessonId: string
-  ): string {
-    return `${userToken}::${accountKey}::${lessonId}`;
+  static buildSessionKey(accountKey: string, lessonId: string): string {
+    return `${accountKey}::${lessonId}`;
   }
 
-  isWatching(userToken: string, accountKey: string, lessonId: string): boolean {
-    const key = RcAutoAnswerEngine.buildSessionKey(
-      userToken,
-      accountKey,
-      lessonId
-    );
+  isWatching(accountKey: string, lessonId: string): boolean {
+    const key = RcAutoAnswerEngine.buildSessionKey(accountKey, lessonId);
     const s = this.sessions.get(key);
     return Boolean(s && !s.disposed && !s.isFinished);
   }
 
-  isLessonFinished(
-    userToken: string,
-    accountKey: string,
-    lessonId: string
-  ): boolean {
+  isLessonFinished(accountKey: string, lessonId: string): boolean {
     return this.finishedKeys.has(
-      RcAutoAnswerEngine.buildSessionKey(userToken, accountKey, lessonId)
+      RcAutoAnswerEngine.buildSessionKey(accountKey, lessonId)
     );
   }
 
@@ -114,13 +101,13 @@ export class RcAutoAnswerEngine {
     return count;
   }
 
-  getWorkspaceSessions(userToken: string): ActiveSessionSnapshot[] {
+  getSessionsForAccounts(accountKeys: Iterable<string>): ActiveSessionSnapshot[] {
+    const keySet = new Set(accountKeys);
     const out: ActiveSessionSnapshot[] = [];
     for (const s of this.sessions.values()) {
-      if (s.userToken !== userToken || s.disposed || s.isFinished) continue;
+      if (!keySet.has(s.accountKey) || s.disposed || s.isFinished) continue;
       out.push({
         sessionKey: s.sessionKey,
-        userToken: s.userToken,
         accountKey: s.accountKey,
         accountName: s.accountName,
         lessonId: s.lessonId,
@@ -139,25 +126,34 @@ export class RcAutoAnswerEngine {
     return out;
   }
 
+  getSessionAccountKey(sessionKey: string): string | null {
+    const s = this.sessions.get(sessionKey);
+    if (!s || s.disposed || s.isFinished) return null;
+    return s.accountKey;
+  }
+
   setSessionPaused(
-    userToken: string,
     sessionKey: string,
-    paused: boolean
+    paused: boolean,
+    allowedAccountKeys?: Iterable<string>
   ): boolean {
     const s = this.sessions.get(sessionKey);
-    if (!s || s.userToken !== userToken || s.disposed || s.isFinished) {
+    if (!s || s.disposed || s.isFinished) {
       return false;
+    }
+    if (allowedAccountKeys) {
+      const allowed = new Set(allowedAccountKeys);
+      if (!allowed.has(s.accountKey)) return false;
     }
     s.paused = paused;
     s.lastActivityAt = formatUtc8Iso();
     if (paused) {
-      for (const timer of s.delayTimers.values()) {
-        clearTimeout(timer);
+      for (const cancel of s.delayTimers.values()) {
+        cancel();
       }
       s.delayTimers.clear();
     }
     this.db.addLog({
-      userToken: s.userToken,
       accountKey: s.accountKey,
       accountName: s.accountName,
       platform: 'rainClassroom',
@@ -174,13 +170,10 @@ export class RcAutoAnswerEngine {
   /**
    * 账号退出/被移除时立即断开其全部雨课堂 WS 会话并清理定时器。
    */
-  detachAccount(userToken: string, accountKey: string): number {
+  detachAccount(accountKey: string): number {
     let detached = 0;
     for (const [key, session] of this.sessions.entries()) {
-      if (
-        session.userToken === userToken &&
-        session.accountKey === accountKey
-      ) {
+      if (session.accountKey === accountKey) {
         this.disposeSession(session);
         this.sessions.delete(key);
         detached++;
@@ -210,7 +203,6 @@ export class RcAutoAnswerEngine {
     if (!lessonId) return;
 
     const sessionKey = RcAutoAnswerEngine.buildSessionKey(
-      account.userToken,
       account.accountKey,
       lessonId
     );
@@ -229,7 +221,6 @@ export class RcAutoAnswerEngine {
     const nowIso = formatUtc8Iso();
     const session: InternalLessonSession = {
       sessionKey,
-      userToken: account.userToken,
       accountKey: account.accountKey,
       accountName: account.name,
       lessonId,
@@ -260,7 +251,6 @@ export class RcAutoAnswerEngine {
 
     this.sessions.set(sessionKey, session);
     this.db.addLog({
-      userToken: account.userToken,
       accountKey: account.accountKey,
       accountName: account.name,
       platform: 'rainClassroom',
@@ -276,7 +266,7 @@ export class RcAutoAnswerEngine {
   }
 
   private getFreshAccount(session: InternalLessonSession): StoredAccount | null {
-    return this.db.getAccount(session.userToken, session.accountKey);
+    return this.db.getAccount(session.accountKey);
   }
 
   private async connectSession(session: InternalLessonSession): Promise<void> {
@@ -290,11 +280,7 @@ export class RcAutoAnswerEngine {
 
     try {
       const client = new RainClassroomClient(account, (updatedCookies) => {
-        this.db.updateAccountCookies(
-          account.userToken,
-          account.accountKey,
-          updatedCookies
-        );
+        this.db.updateAccountCookies(account.accountKey, updatedCookies);
       });
 
       if (!session.bearerToken || !session.lessonToken) {
@@ -310,6 +296,8 @@ export class RcAutoAnswerEngine {
         session.bearerToken = res.bearerToken;
         session.lessonToken = res.lessonToken;
       }
+
+      if (session.disposed || session.isFinished) return;
 
       if (session.ws) {
         try {
@@ -377,13 +365,11 @@ export class RcAutoAnswerEngine {
     } catch (err) {
       if (err instanceof SessionExpiredError) {
         this.db.setAccountSessionStatus(
-          account.userToken,
           account.accountKey,
           'session_expired',
           err.message
         );
         this.db.addLog({
-          userToken: account.userToken,
           accountKey: account.accountKey,
           accountName: account.name,
           platform: 'rainClassroom',
@@ -524,11 +510,7 @@ export class RcAutoAnswerEngine {
     if (!account || !session.bearerToken) return;
     try {
       const client = new RainClassroomClient(account, (cookies) => {
-        this.db.updateAccountCookies(
-          account.userToken,
-          account.accountKey,
-          cookies
-        );
+        this.db.updateAccountCookies(account.accountKey, cookies);
       });
       const eligibility = await client.getLocationCheckInEligibility(
         session.bearerToken,
@@ -557,7 +539,6 @@ export class RcAutoAnswerEngine {
       );
       if (asInt(res.code) === 0) {
         this.db.addLog({
-          userToken: account.userToken,
           accountKey: account.accountKey,
           accountName: account.name,
           platform: 'rainClassroom',
@@ -620,7 +601,6 @@ export class RcAutoAnswerEngine {
       if (!problemId) continue;
       if (
         this.db.isProblemAnswered(
-          session.userToken,
           session.accountKey,
           session.lessonId,
           problemId
@@ -748,7 +728,6 @@ export class RcAutoAnswerEngine {
     if (!account || !isAiReady(account.aiConfig)) return;
     if (
       this.db.isProblemAnswered(
-        session.userToken,
         session.accountKey,
         session.lessonId,
         problemId
@@ -807,7 +786,6 @@ export class RcAutoAnswerEngine {
       if (problem.problemType === 5) {
         if (solveResult.requiresHandwritingOrPhoto) {
           this.db.addLog({
-            userToken: account.userToken,
             accountKey: account.accountKey,
             accountName: account.name,
             platform: 'rainClassroom',
@@ -823,7 +801,6 @@ export class RcAutoAnswerEngine {
         }
         if (!account.aiConfig.autoSubmitSubjective) {
           this.db.addLog({
-            userToken: account.userToken,
             accountKey: account.accountKey,
             accountName: account.name,
             platform: 'rainClassroom',
@@ -859,11 +836,21 @@ export class RcAutoAnswerEngine {
       }
 
       await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
         const timer = setTimeout(() => {
           session.delayTimers.delete(problemId);
-          resolve();
+          finish();
         }, waitSec * 1000);
-        session.delayTimers.set(problemId, timer);
+        session.delayTimers.set(problemId, () => {
+          clearTimeout(timer);
+          session.delayTimers.delete(problemId);
+          finish();
+        });
       });
 
       if (session.disposed || session.isFinished || session.paused) return;
@@ -874,7 +861,6 @@ export class RcAutoAnswerEngine {
         `AI 解题异常 (${session.courseTitle} / ${problemId}): ${String(err)}`
       );
       this.db.addLog({
-        userToken: session.userToken,
         accountKey: session.accountKey,
         accountName: session.accountName,
         platform: 'rainClassroom',
@@ -918,7 +904,6 @@ export class RcAutoAnswerEngine {
 
     if (ok) {
       this.db.markProblemAnswered(
-        session.userToken,
         session.accountKey,
         session.lessonId,
         problem.problemId
@@ -926,7 +911,6 @@ export class RcAutoAnswerEngine {
       session.solvedCount++;
       session.lastActivityAt = formatUtc8Iso();
       this.db.addLog({
-        userToken: account.userToken,
         accountKey: account.accountKey,
         accountName: account.name,
         platform: 'rainClassroom',
@@ -940,7 +924,6 @@ export class RcAutoAnswerEngine {
       });
     } else {
       this.db.addLog({
-        userToken: account.userToken,
         accountKey: account.accountKey,
         accountName: account.name,
         platform: 'rainClassroom',
@@ -960,7 +943,6 @@ export class RcAutoAnswerEngine {
     session.isFinished = true;
     this.finishedKeys.add(session.sessionKey);
     this.db.addLog({
-      userToken: session.userToken,
       accountKey: session.accountKey,
       accountName: session.accountName,
       platform: 'rainClassroom',
@@ -986,8 +968,8 @@ export class RcAutoAnswerEngine {
       clearInterval(session.healthTimer);
       session.healthTimer = null;
     }
-    for (const timer of session.delayTimers.values()) {
-      clearTimeout(timer);
+    for (const cancel of session.delayTimers.values()) {
+      cancel();
     }
     session.delayTimers.clear();
     if (session.ws) {

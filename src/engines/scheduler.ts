@@ -58,6 +58,7 @@ export function fuzzyMatchOnlineCourse(
 export class CloudSchedulerEngine {
   private pollTimer: NodeJS.Timeout | null = null;
   private exactTimer: NodeJS.Timeout | null = null;
+  private pruneTimer: NodeJS.Timeout | null = null;
   private isTicking = false;
   private readonly courseCache = new Map<string, CourseCacheEntry>();
   private readonly loggedManualActives = new Set<string>();
@@ -74,6 +75,10 @@ export class CloudSchedulerEngine {
     this.pollTimer = setInterval(() => {
       void this.tick();
     }, this.config.pollIntervalMs);
+    this.pruneTimer = setInterval(() => {
+      this.pruneStaleDevicesNow();
+    }, 60 * 60 * 1000);
+    this.pruneStaleDevicesNow();
     this.refreshExactTrigger();
     void this.tick();
     this.logger.info(
@@ -90,6 +95,28 @@ export class CloudSchedulerEngine {
     if (this.exactTimer) {
       clearTimeout(this.exactTimer);
       this.exactTimer = null;
+    }
+    if (this.pruneTimer) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+  }
+
+  pruneStaleDevicesNow(maxAgeMs = 14 * 24 * 60 * 60 * 1000): void {
+    try {
+      const { prunedBindings, stoppedAccountKeys } =
+        this.db.pruneStaleDevices(maxAgeMs);
+      for (const accKey of stoppedAccountKeys) {
+        this.rcAutoAnswer.detachAccount(accKey);
+      }
+      if (prunedBindings > 0 || stoppedAccountKeys.length > 0) {
+        this.logger.info(
+          'scheduler',
+          `已清理超期设备绑定=${prunedBindings}，自动停服账号=${stoppedAccountKeys.length}`
+        );
+      }
+    } catch (err) {
+      this.logger.warn('scheduler', `清理超期设备绑定异常: ${String(err)}`);
     }
   }
 
@@ -235,13 +262,11 @@ export class CloudSchedulerEngine {
     } catch (err) {
       if (err instanceof SessionExpiredError) {
         this.db.setAccountSessionStatus(
-          account.userToken,
           account.accountKey,
           'session_expired',
           err.message
         );
         this.db.addLog({
-          userToken: account.userToken,
           accountKey: account.accountKey,
           accountName: account.name,
           platform: account.platform,
@@ -264,7 +289,7 @@ export class CloudSchedulerEngine {
     fetcher: () => Promise<OnlineCourse[]>,
     nowMs: number
   ): Promise<OnlineCourse[]> {
-    const cacheKey = `${account.userToken}::${account.accountKey}`;
+    const cacheKey = account.accountKey;
     const hit = this.courseCache.get(cacheKey);
     if (hit && nowMs - hit.fetchedAt < 3 * 60 * 1000 && hit.courses.length > 0) {
       return hit.courses;
@@ -283,11 +308,7 @@ export class CloudSchedulerEngine {
     nowMs: number
   ): Promise<void> {
     const client = new RainClassroomClient(account, (cookies) => {
-      this.db.updateAccountCookies(
-        account.userToken,
-        account.accountKey,
-        cookies
-      );
+      this.db.updateAccountCookies(account.accountKey, cookies);
     });
 
     let enrolledCourses: OnlineCourse[] = [];
@@ -364,7 +385,6 @@ export class CloudSchedulerEngine {
 
       const targetCourseId = matchedCourseId ?? boundCourseId ?? '';
       const alreadySigned = this.db.isReservationSigned(
-        account.userToken,
         account.accountKey,
         slot.reservation.id,
         slot.dateKey
@@ -373,23 +393,14 @@ export class CloudSchedulerEngine {
       if (alreadySigned) {
         // 连堂课下半场巡检：新开且未托管/未下课的 lessonId 自动二次进班续挂 AI
         if (
-          this.rcAutoAnswer.isWatching(
-            account.userToken,
-            account.accountKey,
-            matchedLessonId
-          ) ||
-          this.rcAutoAnswer.isLessonFinished(
-            account.userToken,
-            account.accountKey,
-            matchedLessonId
-          )
+          this.rcAutoAnswer.isWatching(account.accountKey, matchedLessonId) ||
+          this.rcAutoAnswer.isLessonFinished(account.accountKey, matchedLessonId)
         ) {
           continue;
         }
         const recheck = await client.checkIn(matchedLessonId);
         if (recheck.code === 0) {
           this.db.addLog({
-            userToken: account.userToken,
             accountKey: account.accountKey,
             accountName: account.name,
             platform: 'rainClassroom',
@@ -453,7 +464,6 @@ export class CloudSchedulerEngine {
             signDetail = `云端自动定位签到成功 (${loc.address})`;
           } else {
             this.db.addLog({
-              userToken: account.userToken,
               accountKey: account.accountKey,
               accountName: account.name,
               platform: 'rainClassroom',
@@ -470,14 +480,12 @@ export class CloudSchedulerEngine {
       }
 
       this.db.markReservationSigned(
-        account.userToken,
         account.accountKey,
         slot.reservation.id,
         slot.dateKey,
         signDetail
       );
       this.db.addLog({
-        userToken: account.userToken,
         accountKey: account.accountKey,
         accountName: account.name,
         platform: 'rainClassroom',
@@ -509,11 +517,7 @@ export class CloudSchedulerEngine {
     nowMs: number
   ): Promise<void> {
     const client = new ChaoXingClient(account, (cookies) => {
-      this.db.updateAccountCookies(
-        account.userToken,
-        account.accountKey,
-        cookies
-      );
+      this.db.updateAccountCookies(account.accountKey, cookies);
     });
 
     const courses = needPrefetch
@@ -528,7 +532,6 @@ export class CloudSchedulerEngine {
     for (const slot of activeSlots) {
       if (
         this.db.isReservationSigned(
-          account.userToken,
           account.accountKey,
           slot.reservation.id,
           slot.dateKey
@@ -557,7 +560,6 @@ export class CloudSchedulerEngine {
         const already = await client.isAlreadySigned(active.id);
         if (already) {
           this.db.markReservationSigned(
-            account.userToken,
             account.accountKey,
             slot.reservation.id,
             slot.dateKey,
@@ -581,14 +583,12 @@ export class CloudSchedulerEngine {
             text.includes('签到成功')
           ) {
             this.db.markReservationSigned(
-              account.userToken,
               account.accountKey,
               slot.reservation.id,
               slot.dateKey,
               '学习通普通签到成功'
             );
             this.db.addLog({
-              userToken: account.userToken,
               accountKey: account.accountKey,
               accountName: account.name,
               platform: 'chaoxing',
@@ -628,14 +628,12 @@ export class CloudSchedulerEngine {
             text.includes('签到成功')
           ) {
             this.db.markReservationSigned(
-              account.userToken,
               account.accountKey,
               slot.reservation.id,
               slot.dateKey,
               `学习通自动定位签到成功 (${loc.address})`
             );
             this.db.addLog({
-              userToken: account.userToken,
               accountKey: account.accountKey,
               accountName: account.name,
               platform: 'chaoxing',
@@ -649,7 +647,7 @@ export class CloudSchedulerEngine {
           }
         } else {
           // 手势、签到码、二维码、拍照或人脸签到需要人工介入
-          const warnKey = `${account.userToken}:${account.accountKey}:${active.id}`;
+          const warnKey = `${account.accountKey}:${active.id}`;
           if (!this.loggedManualActives.has(warnKey)) {
             this.loggedManualActives.add(warnKey);
             const reason = detail.needPhoto
@@ -664,7 +662,6 @@ export class CloudSchedulerEngine {
                       ? '二维码签到'
                       : '需要人工验证的签到';
             this.db.addLog({
-              userToken: account.userToken,
               accountKey: account.accountKey,
               accountName: account.name,
               platform: 'chaoxing',

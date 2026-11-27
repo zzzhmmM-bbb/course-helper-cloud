@@ -5,7 +5,11 @@ import {
   getCxEncParams,
   getUniqueId,
 } from '../crypto.js';
-import type { OnlineCourse, StoredAccount } from '../types.js';
+import type {
+  OnlineCourse,
+  OwnershipVerifyResult,
+  StoredAccount,
+} from '../types.js';
 import { SessionExpiredError } from './rainclassroom.js';
 
 export interface CxActiveItem {
@@ -86,6 +90,7 @@ export class ChaoXingClient {
       ? getSetCookie.call(response.headers)
       : [];
     if (!setCookies.length) return;
+    const delta: Record<string, string> = {};
     let changed = false;
     for (const rawHeader of setCookies) {
       const firstPart = rawHeader.split(';')[0] ?? '';
@@ -95,11 +100,12 @@ export class ChaoXingClient {
       const val = firstPart.slice(eqIdx + 1).trim();
       if (key && this.cookies[key] !== val) {
         this.cookies[key] = val;
+        delta[key] = val;
         changed = true;
       }
     }
     if (changed && this.onCookiesUpdated) {
-      this.onCookiesUpdated({ ...this.cookies });
+      this.onCookiesUpdated(delta);
     }
   }
 
@@ -184,6 +190,85 @@ export class ChaoXingClient {
       return asRecord(JSON.parse(text));
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * 严格校验证明学习通 Cookie 真实有效且归属于 expectedUid。
+   * 1) 先核对 Cookie 内 UID/_uid 字段严格匹配 expectedUid；
+   * 2) 优先通过 sso userLogin4Uname.do GET 核验返回 msg.puid === expectedUid；
+   * 3) 若该接口未返回 puid 且未过期，则回退校验 backclazzdata（超星服务端会对 UID+uf/_d/vc3 验签）。
+   */
+  async verifyOwnership(expectedUid: string): Promise<OwnershipVerifyResult> {
+    const claimed = String(expectedUid ?? '').trim();
+    if (!claimed) {
+      return { ok: false, expired: false, reason: '缺少目标 UID' };
+    }
+    const uidVal = String(this.cookies.UID ?? '').trim();
+    const underUidVal = String(this.cookies._uid ?? '').trim();
+    if (!uidVal && !underUidVal) {
+      return { ok: false, expired: true, reason: '学习通 Cookie 缺少 UID' };
+    }
+    if ((uidVal && uidVal !== claimed) || (underUidVal && underUidVal !== claimed)) {
+      return {
+        ok: false,
+        expired: false,
+        actualUid: underUidVal || uidVal,
+        reason: '学习通 Cookie 中的 UID/_uid 与目标账号不一致',
+      };
+    }
+    try {
+      const sso = await this.requestJson(
+        'https://sso.chaoxing.com/apis/login/userLogin4Uname.do',
+        { timeoutMs: 10000 }
+      );
+      if (sso && Number(sso.result) === 1) {
+        const msg = asRecord(sso.msg);
+        const puid = msg?.puid !== undefined && msg?.puid !== null
+          ? String(msg.puid).trim()
+          : '';
+        if (puid) {
+          if (puid !== claimed) {
+            return {
+              ok: false,
+              expired: false,
+              actualUid: puid,
+              reason: '学习通 SSO 返回的 puid 与目标账号不一致',
+            };
+          }
+          return { ok: true, actualUid: puid };
+        }
+      }
+
+      // 回退校验前强制要求 _uid === claimed，彻底杜绝 UID/_uid 分裂绕过
+      if (underUidVal !== claimed) {
+        return {
+          ok: false,
+          expired: true,
+          reason: '学习通 Cookie 缺少与账号一致的 _uid 凭证',
+        };
+      }
+      const clazz = await this.requestJson(
+        'https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&getTchClazzType=1&mcode=',
+        { timeoutMs: 10000 }
+      );
+      if (clazz && Number(clazz.result) === 1) {
+        return { ok: true, actualUid: claimed };
+      }
+      return {
+        ok: false,
+        expired: true,
+        reason: '学习通会话校验未通过，请重新登录',
+      };
+    } catch (err) {
+      if (err instanceof SessionExpiredError) {
+        return { ok: false, expired: true, reason: err.message };
+      }
+      return {
+        ok: false,
+        expired: false,
+        reason: `学习通归属校验失败: ${String(err)}`,
+      };
     }
   }
 

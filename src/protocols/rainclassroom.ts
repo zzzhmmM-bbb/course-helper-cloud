@@ -2,6 +2,7 @@ import { getUniqueId } from '../crypto.js';
 import {
   rcServerBaseUrl,
   type OnlineCourse,
+  type OwnershipVerifyResult,
   type PresentationData,
   type PresentationSlide,
   type ProblemData,
@@ -223,6 +224,7 @@ export class RainClassroomClient {
       : [];
 
     if (!setCookies.length) return;
+    const delta: Record<string, string> = {};
     let changed = false;
     for (const rawHeader of setCookies) {
       const firstPart = rawHeader.split(';')[0] ?? '';
@@ -232,11 +234,12 @@ export class RainClassroomClient {
       const val = firstPart.slice(eqIdx + 1).trim();
       if (key && this.cookies[key] !== val) {
         this.cookies[key] = val;
+        delta[key] = val;
         changed = true;
       }
     }
     if (changed && this.onCookiesUpdated) {
-      this.onCookiesUpdated({ ...this.cookies });
+      this.onCookiesUpdated(delta);
     }
   }
 
@@ -311,6 +314,55 @@ export class RainClassroomClient {
       return { status: resp.status, headers: resp.headers, data: parsed };
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 严格校验证明当前 Cookie 确实归属于 expectedUid（调用 /v/course_meta/user_info 比对真实 user_id）。
+   */
+  async verifyOwnership(expectedUid: string): Promise<OwnershipVerifyResult> {
+    const claimed = String(expectedUid ?? '').trim();
+    if (!claimed) {
+      return { ok: false, expired: false, reason: '缺少目标 UID' };
+    }
+    if (!this.cookies.sessionid) {
+      return { ok: false, expired: true, reason: '雨课堂 Cookie 缺少 sessionid' };
+    }
+    try {
+      const { data } = await this.requestJson('/v/course_meta/user_info', {
+        timeoutMs: 10000,
+      });
+      const inner = asRecord(data.data);
+      const profile =
+        asRecord(inner?.user_profile) ?? asRecord(data.user_profile);
+      const rawUid =
+        profile?.user_id ?? inner?.user_id ?? data.user_id ?? null;
+      const actualUid = rawUid !== null && rawUid !== undefined ? String(rawUid).trim() : '';
+      if (!actualUid) {
+        return {
+          ok: false,
+          expired: true,
+          reason: '无法从雨课堂用户信息接口确认 UID',
+        };
+      }
+      if (actualUid !== claimed) {
+        return {
+          ok: false,
+          expired: false,
+          actualUid,
+          reason: '雨课堂 Cookie 所属账号与目标 UID 不一致',
+        };
+      }
+      return { ok: true, actualUid };
+    } catch (err) {
+      if (err instanceof SessionExpiredError) {
+        return { ok: false, expired: true, reason: err.message };
+      }
+      return {
+        ok: false,
+        expired: false,
+        reason: `雨课堂归属校验失败: ${String(err)}`,
+      };
     }
   }
 
