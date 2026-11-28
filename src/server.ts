@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { testVisionConnection } from './ai/vision_solver.js';
+import { isAiReady, testVisionConnection } from './ai/vision_solver.js';
 import type { AppConfig, Logger } from './config.js';
 import { safeEqual } from './crypto.js';
 import {
@@ -16,13 +16,20 @@ import {
   matchesStoredSessionToken,
   type OwnershipVerifier,
 } from './protocols/ownership.js';
-import { formatUtc8Iso } from './time.js';
+import { RainClassroomClient } from './protocols/rainclassroom.js';
+import {
+  computeClassSessionGuardExpiryUtc8,
+  formatUtc8Iso,
+  getUtc8Parts,
+} from './time.js';
 import type {
   AiConfig,
   CloudSyncRequest,
   PullSyncRequest,
   PushAccountConfigRequest,
   RainClassroomServerType,
+  RcLessonGuardLocation,
+  ReportRcLessonGuardRequest,
   StoredAccount,
 } from './types.js';
 
@@ -137,6 +144,7 @@ export function createCloudServer(deps: {
           ok: true,
           service: 'course-helper-cloud',
           apiVersion: 2,
+          capabilities: ['rc_lesson_guard'],
           uptimeSec: Math.floor((Date.now() - startedAtMs) / 1000),
           activeSessions: rcAutoAnswer.getActiveCount(),
           trackedWorkspaces: stats.workspaces,
@@ -412,6 +420,7 @@ export function createCloudServer(deps: {
             buildAccountHealthSnapshot(db, a, deviceId)
           ),
           activeSessions: rcAutoAnswer.getSessionsForAccounts(boundKeys),
+          activeGuards: db.getActiveRcLessonGuardsForAccounts(boundKeys),
           signedRecords: db.getSignedMapForAccounts(boundKeys),
           logs: db.getLogsForAccounts(boundKeys, logLimit),
         });
@@ -566,6 +575,143 @@ export function createCloudServer(deps: {
           detachedSessions,
           updatedAt: updated.updatedAt,
           semesterStartMonday: config.semesterStartMonday,
+          serverTimeUtc8: formatUtc8Iso(),
+        });
+        return;
+      }
+
+      // 4.5 POST /api/v2/accounts/:accountKey/rc-lesson-guard - 上报雨课堂已签课堂，开启本堂课防试探重开护航
+      const guardMatch =
+        /^\/api\/v2\/accounts\/([^/]+)\/rc-lesson-guard$/.exec(pathname);
+      if (req.method === 'POST' && guardMatch) {
+        const accountKey = decodeURIComponent(guardMatch[1]).trim();
+        const existing = db.getAccount(accountKey);
+        if (!existing) {
+          sendJson(res, 404, { ok: false, error: '云端尚无该账号，请先完成同步' });
+          return;
+        }
+        if (existing.platform !== 'rainClassroom') {
+          sendJson(res, 400, { ok: false, error: '当前护航接口仅支持雨课堂账号' });
+          return;
+        }
+        if (!db.isDeviceBound(accountKey, deviceId)) {
+          sendJson(res, 403, { ok: false, error: '当前设备未绑定该账号，无权上报护航' });
+          return;
+        }
+
+        const body = await readJsonBody<ReportRcLessonGuardRequest>(req);
+        const lessonId = String(body.lessonId ?? '').trim();
+        if (!lessonId) {
+          sendJson(res, 400, { ok: false, error: '缺少 lessonId' });
+          return;
+        }
+
+        let courseId = String(body.courseId ?? '').trim();
+        let classroomId = String(body.classroomId ?? '').trim();
+        let courseTitle = String(body.courseTitle ?? '').trim();
+        const classroom = String(body.classroom ?? '').trim();
+
+        // 若扫码进班时客户端尚未拿到 courseId/classroomId，尝试从实时 on-lesson 补全
+        if (!courseId || !classroomId) {
+          try {
+            const client = new RainClassroomClient(existing, (cookies) => {
+              db.updateAccountCookies(existing.accountKey, cookies);
+            });
+            const onLessons = await client.getOnLesson();
+            const hit = onLessons.find((i) => i.lessonId === lessonId);
+            if (hit) {
+              if (!courseId && hit.courseId) courseId = hit.courseId;
+              if (!classroomId && hit.classroomId) classroomId = hit.classroomId;
+              if (!courseTitle && hit.courseName) courseTitle = hit.courseName;
+            }
+          } catch (err) {
+            logger.warn(
+              'api',
+              `上报护航单时反查 on-lesson 失败 (${accountKey}/${lessonId}): ${String(err)}`
+            );
+          }
+        }
+
+        let lastLocation: RcLessonGuardLocation | null = null;
+        if (body.lastLocation && typeof body.lastLocation === 'object') {
+          const lat = Number(body.lastLocation.latitude);
+          const lng = Number(body.lastLocation.longitude);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            lastLocation = {
+              address: String(body.lastLocation.address ?? ''),
+              latitude: lat,
+              longitude: lng,
+            };
+          }
+        }
+
+        const nowMs = Date.now();
+        const semesterStart =
+          existing.semesterStartMonday || config.semesterStartMonday;
+        const computedExpireMs = computeClassSessionGuardExpiryUtc8({
+          semesterStartMondayKey: semesterStart,
+          timetable: existing.timetable,
+          reservations: existing.reservations,
+          courseId,
+          classroomId,
+          courseTitle,
+          nowMs,
+        });
+        const requestedExpireMs =
+          typeof body.expireAtMs === 'number' &&
+          Number.isFinite(body.expireAtMs) &&
+          body.expireAtMs > nowMs
+            ? body.expireAtMs
+            : 0;
+        const expireAtMs = Math.max(computedExpireMs, requestedExpireMs);
+
+        db.touchDeviceLastSeen(deviceId);
+        const { guard, created } = db.upsertRcLessonGuard({
+          accountKey,
+          lessonId,
+          courseId,
+          classroomId,
+          courseTitle: courseTitle || '雨课堂课程',
+          classroom,
+          lastLocation,
+          expireAtMs,
+          nowMs,
+        });
+
+        if (created) {
+          const endParts = getUtc8Parts(guard.expireAtMs);
+          const endHHMM = `${String(endParts.hour).padStart(2, '0')}:${String(endParts.minute).padStart(2, '0')}`;
+          db.addLog({
+            accountKey: existing.accountKey,
+            accountName: existing.name,
+            platform: 'rainClassroom',
+            category: 'session',
+            level: 'info',
+            title: `已开启本堂课防重开护航《${guard.courseTitle || '雨课堂课程'}》`,
+            detail: `下课前（至 ${endHHMM}）若老师关闭并重开雨课堂将自动补签 · 账号 ${existing.name}`,
+            courseName: guard.courseTitle || '雨课堂课程',
+            lessonId,
+          });
+        }
+
+        // 顺带挂载 WS（若配了 AI 同时自动答题；未配 AI 也监听课中定位与下课秒级重检）
+        if (!rcAutoAnswer.isWatching(accountKey, lessonId)) {
+          void rcAutoAnswer.attachLesson({
+            account: existing,
+            lessonId,
+            courseId: guard.courseId,
+            courseTitle: guard.courseTitle || '雨课堂课程',
+            classroom: guard.classroom,
+            watchOnly: !isAiReady(existing.aiConfig),
+            guardLocationFallback: guard.lastLocation,
+          });
+        }
+
+        scheduler.onWorkspaceUpdated();
+        sendJson(res, 200, {
+          ok: true,
+          created,
+          guard,
           serverTimeUtc8: formatUtc8Iso(),
         });
         return;
@@ -875,6 +1021,7 @@ export function createCloudServer(deps: {
             buildAccountHealthSnapshot(db, a, deviceId)
           ),
           activeSessions: rcAutoAnswer.getSessionsForAccounts(boundKeys),
+          activeGuards: db.getActiveRcLessonGuardsForAccounts(boundKeys),
           signedRecords: db.getSignedMapForAccounts(boundKeys),
           logs: db.getLogsForAccounts(boundKeys, limit),
         });

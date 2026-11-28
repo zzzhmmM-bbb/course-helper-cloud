@@ -1,4 +1,8 @@
-import type { SignReservation, TimetableCourse } from './types.js';
+import {
+  normalizeCourseName,
+  type SignReservation,
+  type TimetableCourse,
+} from './types.js';
 
 const UTC8_OFFSET_MS = 8 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -224,4 +228,179 @@ export function computeSlotEpochsUtc8(
 export function formatUtc8Iso(epochMs: number = Date.now()): string {
   const p = getUtc8Parts(epochMs);
   return `${p.dateKey}T${pad2(p.hour)}:${pad2(p.minute)}:${pad2(p.second)}+08:00`;
+}
+
+/** 珠科 1-12 节最晚下课时刻（覆盖 8:10 错峰组），用于本堂课防重开护航截止计算 */
+const SECTION_BELL_ENDS_LATEST: readonly { hour: number; minute: number }[] = [
+  { hour: 8, minute: 55 },  // 1
+  { hour: 9, minute: 50 },  // 2
+  { hour: 11, minute: 5 },  // 3
+  { hour: 12, minute: 0 },  // 4
+  { hour: 14, minute: 45 }, // 5
+  { hour: 15, minute: 40 }, // 6
+  { hour: 16, minute: 45 }, // 7
+  { hour: 17, minute: 40 }, // 8
+  { hour: 19, minute: 45 }, // 9
+  { hour: 20, minute: 40 }, // 10
+  { hour: 21, minute: 35 }, // 11
+  { hour: 22, minute: 30 }, // 12
+];
+
+/** 未导课表/临时课时的标准大节归属窗（含下课后 15 分钟拖堂缓冲） */
+const BIG_SECTION_GUARD_WINDOWS: readonly {
+  startMin: number;
+  endHour: number;
+  endMinute: number;
+}[] = [
+  { startMin: 7 * 60 + 40, endHour: 10, endMinute: 5 },  // 1-2 节 (09:50 + 15m)
+  { startMin: 10 * 60 + 5, endHour: 12, endMinute: 15 }, // 3-4 节 (12:00 + 15m)
+  { startMin: 13 * 60 + 40, endHour: 15, endMinute: 55 }, // 5-6 节 (15:40 + 15m)
+  { startMin: 15 * 60 + 55, endHour: 17, endMinute: 55 }, // 7-8 节 (17:40 + 15m)
+  { startMin: 18 * 60 + 40, endHour: 20, endMinute: 55 }, // 9-10 节 (20:40 + 15m)
+  { startMin: 20 * 60 + 55, endHour: 22, endMinute: 45 }, // 11-12 节 (22:30 + 15m)
+];
+
+function fuzzyCourseTitleMatch(a: string, b: string): boolean {
+  const na = normalizeCourseName(a);
+  const nb = normalizeCourseName(b);
+  if (!na || !nb) return false;
+  return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+/**
+ * 计算「本堂课防试探重签护航」的截止时间戳（UTC+8，绝不跨天或跨大节乱签）：
+ * 1. 课表优先：匹配今日该周对应课程且当前处于该节次范围内，保至该大节下课后 +15 分钟；
+ * 2. 智能大节兜底：未导课表或临时课时，按珠科标准大节保至该大节下课后 +15 分钟；
+ * 3. 非标准时段兜底：从当前时刻起守护 120 分钟（且不超过当日 23:59:59）。
+ */
+export function computeClassSessionGuardExpiryUtc8(params: {
+  semesterStartMondayKey: string;
+  timetable: TimetableCourse[];
+  reservations?: SignReservation[];
+  courseId?: string;
+  classroomId?: string;
+  courseTitle?: string;
+  nowMs?: number;
+}): number {
+  const nowMs = params.nowMs ?? Date.now();
+  const nowParts = getUtc8Parts(nowMs);
+  const todayEndMs = utc8EpochMs(
+    nowParts.year,
+    nowParts.month,
+    nowParts.day,
+    23,
+    59,
+    59
+  );
+  const bufferMs = 15 * 60 * 1000;
+  const currentWeek = academicWeekForEpoch(
+    params.semesterStartMondayKey,
+    nowMs
+  );
+
+  const courseId = (params.courseId ?? '').trim();
+  const classroomId = (params.classroomId ?? '').trim();
+  const courseTitle = (params.courseTitle ?? '').trim();
+
+  // 1. 课表优先匹配
+  if (params.timetable.length > 0) {
+    const resByCourseId = new Map<string, SignReservation[]>();
+    for (const r of params.reservations ?? []) {
+      const list = resByCourseId.get(r.timetableCourseId) ?? [];
+      list.push(r);
+      resByCourseId.set(r.timetableCourseId, list);
+    }
+
+    let bestMatchedEndMs: number | null = null;
+    for (const course of params.timetable) {
+      if (course.weekday !== nowParts.weekday) continue;
+      if (course.weeks.length > 0 && !course.weeks.includes(currentWeek)) {
+        continue;
+      }
+
+      const win = defaultWatchWindowForCourse(course);
+      const startMs = utc8EpochMs(
+        nowParts.year,
+        nowParts.month,
+        nowParts.day,
+        win.defaultTriggerHour,
+        win.defaultTriggerMinute,
+        0
+      );
+      const endIdx = Math.max(
+        0,
+        Math.min(
+          SECTION_BELL_ENDS_LATEST.length - 1,
+          (course.endSection || course.startSection || 1) - 1
+        )
+      );
+      const bellEnd = SECTION_BELL_ENDS_LATEST[endIdx];
+      const bellEndMs = utc8EpochMs(
+        nowParts.year,
+        nowParts.month,
+        nowParts.day,
+        bellEnd.hour,
+        bellEnd.minute,
+        0
+      );
+
+      // 必须在当前课的合理时间段内（开课前 25 分钟 ~ 下课后 20 分钟）
+      if (nowMs < startMs - 25 * 60 * 1000 || nowMs > bellEndMs + 20 * 60 * 1000) {
+        continue;
+      }
+
+      const linkedRes = resByCourseId.get(course.id) ?? [];
+      const idMatched = Boolean(
+        courseId &&
+          linkedRes.some(
+            (r) =>
+              r.boundOnlineCourseId?.trim() === courseId &&
+              (!classroomId ||
+                !r.boundOnlineClassId?.trim() ||
+                r.boundOnlineClassId.trim() === classroomId)
+          )
+      );
+      const titleMatched = Boolean(
+        courseTitle && fuzzyCourseTitleMatch(course.name, courseTitle)
+      );
+
+      if (idMatched || titleMatched) {
+        const candidateEnd = Math.min(
+          todayEndMs,
+          Math.max(bellEndMs + bufferMs, nowMs + 20 * 60 * 1000)
+        );
+        if (bestMatchedEndMs === null || candidateEnd > bestMatchedEndMs) {
+          bestMatchedEndMs = candidateEnd;
+        }
+      }
+    }
+
+    if (bestMatchedEndMs !== null) {
+      return bestMatchedEndMs;
+    }
+  }
+
+  // 2. 智能珠科大节兜底
+  const minsOfDay = nowParts.hour * 60 + nowParts.minute;
+  for (const w of BIG_SECTION_GUARD_WINDOWS) {
+    const endMin = w.endHour * 60 + w.endMinute;
+    if (minsOfDay >= w.startMin && minsOfDay <= endMin) {
+      const windowEndMs = utc8EpochMs(
+        nowParts.year,
+        nowParts.month,
+        nowParts.day,
+        w.endHour,
+        w.endMinute,
+        0
+      );
+      // 若临近该大节截止最后 15 分钟内才首次签到，补足 20 分钟短缓冲防老师拖堂重开
+      return Math.min(
+        todayEndMs,
+        Math.max(windowEndMs, nowMs + 20 * 60 * 1000)
+      );
+    }
+  }
+
+  // 3. 非标准时段（如午间/傍晚临时课）：守护 120 分钟且不跨天
+  return Math.min(todayEndMs, nowMs + 120 * 60 * 1000);
 }

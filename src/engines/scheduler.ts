@@ -1,25 +1,53 @@
+import { isAiReady } from '../ai/vision_solver.js';
 import { resolveLocationForSignIn } from '../campus.js';
 import type { AppConfig, Logger } from '../config.js';
-import type { CloudDatabase } from '../db.js';
+import { CloudDatabase } from '../db.js';
 import { ChaoXingClient } from '../protocols/chaoxing.js';
 import {
   RainClassroomClient,
   requiresPendingLocationSignIn,
   SessionExpiredError,
+  type RcCheckInResult,
+  type RcLocationEligibility,
+  type RcOnLessonItem,
 } from '../protocols/rainclassroom.js';
 import {
   academicWeekForEpoch,
+  computeClassSessionGuardExpiryUtc8,
   computeSlotEpochsUtc8,
   getUtc8Parts,
 } from '../time.js';
 import {
   normalizeCourseName,
   type OnlineCourse,
+  type RcLessonGuardLocation,
+  type RcLessonGuardRecord,
   type SignReservation,
   type StoredAccount,
   type TimetableCourse,
 } from '../types.js';
 import type { RcAutoAnswerEngine } from './rc_auto_answer.js';
+
+export interface RcSchedulerClientLike {
+  getAllEnrolledCourses(): Promise<OnlineCourse[]>;
+  getOnLesson(): Promise<RcOnLessonItem[]>;
+  checkIn(lessonId: string): Promise<RcCheckInResult>;
+  getLocationCheckInEligibility(
+    bearerToken: string
+  ): Promise<RcLocationEligibility | null>;
+  submitLocationCheckIn(
+    bearerToken: string,
+    lessonId: string,
+    latitude: number,
+    longitude: number,
+    address: string
+  ): Promise<Record<string, unknown>>;
+}
+
+export type RcClientFactory = (
+  account: StoredAccount,
+  onCookiesUpdated: (cookies: Record<string, string>) => void
+) => RcSchedulerClientLike;
 
 interface WatchSlot {
   course: TimetableCourse;
@@ -59,16 +87,39 @@ export class CloudSchedulerEngine {
   private pollTimer: NodeJS.Timeout | null = null;
   private exactTimer: NodeJS.Timeout | null = null;
   private pruneTimer: NodeJS.Timeout | null = null;
+  private readonly fastRecheckTimers = new Set<NodeJS.Timeout>();
   private isTicking = false;
   private readonly courseCache = new Map<string, CourseCacheEntry>();
   private readonly loggedManualActives = new Set<string>();
+  private readonly rcClientFactory: RcClientFactory;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: CloudDatabase,
     private readonly rcAutoAnswer: RcAutoAnswerEngine,
-    private readonly logger: Logger
-  ) {}
+    private readonly logger: Logger,
+    rcClientFactory?: RcClientFactory
+  ) {
+    this.rcClientFactory =
+      rcClientFactory ??
+      ((account, onCookiesUpdated) =>
+        new RainClassroomClient(account, onCookiesUpdated));
+    this.rcAutoAnswer.setOnLessonFinished((accountKey) => {
+      this.scheduleFastRecheck(accountKey);
+    });
+  }
+
+  scheduleFastRecheck(accountKey: string): void {
+    const activeGuards = this.db.getActiveRcLessonGuards(accountKey);
+    if (activeGuards.length === 0) return;
+    for (const delayMs of [2500, 7500]) {
+      const t = setTimeout(() => {
+        this.fastRecheckTimers.delete(t);
+        void this.tick();
+      }, delayMs);
+      this.fastRecheckTimers.add(t);
+    }
+  }
 
   start(): void {
     if (this.pollTimer) return;
@@ -100,10 +151,15 @@ export class CloudSchedulerEngine {
       clearInterval(this.pruneTimer);
       this.pruneTimer = null;
     }
+    for (const t of this.fastRecheckTimers) {
+      clearTimeout(t);
+    }
+    this.fastRecheckTimers.clear();
   }
 
   pruneStaleDevicesNow(maxAgeMs = 14 * 24 * 60 * 60 * 1000): void {
     try {
+      this.db.pruneExpiredRcLessonGuards();
       const { prunedBindings, stoppedAccountKeys } =
         this.db.pruneStaleDevices(maxAgeMs);
       for (const accKey of stoppedAccountKeys) {
@@ -229,7 +285,13 @@ export class CloudSchedulerEngine {
     nowMs: number
   ): Promise<void> {
     const slots = this.getTodayWatchSlotsForAccount(account, nowMs);
-    if (!slots.length) return;
+    const activeGuards =
+      account.platform === 'rainClassroom' &&
+      account.sessionStatus !== 'session_expired'
+        ? this.db.getActiveRcLessonGuards(account.accountKey, nowMs)
+        : [];
+
+    if (!slots.length && !activeGuards.length) return;
 
     // 课前 5 分钟预热已选课程列表缓存
     const needPrefetch = slots.some(
@@ -241,13 +303,14 @@ export class CloudSchedulerEngine {
       (s) => nowMs >= s.triggerEpochMs && nowMs <= s.endEpochMs
     );
 
-    if (!needPrefetch && !activeSlots.length) return;
+    if (!needPrefetch && !activeSlots.length && !activeGuards.length) return;
 
     try {
       if (account.platform === 'rainClassroom') {
         await this.processRainClassroomAccount(
           account,
           activeSlots,
+          activeGuards,
           needPrefetch,
           nowMs
         );
@@ -301,13 +364,143 @@ export class CloudSchedulerEngine {
     return fresh;
   }
 
+  private async performRcCheckInAndLocation(params: {
+    client: RcSchedulerClientLike;
+    account: StoredAccount;
+    lessonId: string;
+    courseId: string;
+    courseName: string;
+    classroom: string;
+    fallbackLocation?: RcLessonGuardLocation | null;
+  }): Promise<{
+    ok: boolean;
+    checkRes?: RcCheckInResult;
+    signDetail: string;
+    usedLocation: RcLessonGuardLocation | null;
+  }> {
+    const {
+      client,
+      account,
+      lessonId,
+      courseId,
+      courseName,
+      classroom,
+      fallbackLocation,
+    } = params;
+
+    const checkRes = await client.checkIn(lessonId);
+    if (checkRes.code !== 0) {
+      this.logger.warn(
+        'scheduler',
+        `雨课堂进班签到异常 code=${checkRes.code} course=${courseName}`
+      );
+      return { ok: false, signDetail: '', usedLocation: null };
+    }
+
+    let signDetail = '云端免扫码进班签到成功';
+    let usedLocation: RcLessonGuardLocation | null = null;
+
+    if (checkRes.bearerToken) {
+      const eligibility = await client.getLocationCheckInEligibility(
+        checkRes.bearerToken
+      );
+      if (requiresPendingLocationSignIn(eligibility)) {
+        const preset =
+          (courseId ? account.courseLocations[courseId] ?? null : null) ??
+          (fallbackLocation
+            ? {
+                address: fallbackLocation.address,
+                latitude: fallbackLocation.latitude,
+                longitude: fallbackLocation.longitude,
+                coordType: 'gcj02' as const,
+              }
+            : null);
+        const loc = resolveLocationForSignIn({
+          targetCoord: 'gcj02',
+          preset,
+          teacherLat: eligibility?.centerLat,
+          teacherLng: eligibility?.centerLng,
+          teacherAddress: eligibility?.address,
+          classroom,
+        });
+        const submitRes = await client.submitLocationCheckIn(
+          checkRes.bearerToken,
+          lessonId,
+          loc.latitude,
+          loc.longitude,
+          loc.address
+        );
+        if (Number(submitRes.code) === 0) {
+          signDetail = `云端自动定位签到成功 (${loc.address})`;
+          usedLocation = {
+            address: loc.address,
+            latitude: loc.latitude,
+            longitude: loc.longitude,
+          };
+        } else {
+          this.db.addLog({
+            accountKey: account.accountKey,
+            accountName: account.name,
+            platform: 'rainClassroom',
+            category: 'location',
+            level: 'warn',
+            title: `定位签到提交返回异常《${courseName}》`,
+            detail: `地址：${loc.address}，返回：${JSON.stringify(submitRes).slice(0, 160)}`,
+            courseName,
+            lessonId,
+          });
+          return { ok: false, checkRes, signDetail: '', usedLocation: null };
+        }
+      }
+    }
+
+    return { ok: true, checkRes, signDetail, usedLocation };
+  }
+
+  private matchGuardLessonItems(
+    guard: RcLessonGuardRecord,
+    onLessons: RcOnLessonItem[]
+  ): RcOnLessonItem[] {
+    const matched: RcOnLessonItem[] = [];
+    for (const item of onLessons) {
+      if (guard.classroomId && item.classroomId === guard.classroomId) {
+        matched.push(item);
+        continue;
+      }
+      if (
+        guard.courseId &&
+        item.courseId === guard.courseId &&
+        (!guard.classroomId ||
+          !item.classroomId ||
+          item.classroomId === guard.classroomId)
+      ) {
+        matched.push(item);
+        continue;
+      }
+      if (!guard.courseId && !guard.classroomId && guard.courseTitle) {
+        const hit = fuzzyMatchOnlineCourse(guard.courseTitle, [
+          {
+            courseId: item.courseId,
+            classId: item.classroomId,
+            name: item.courseName,
+            teacher: '',
+            lessonId: item.lessonId,
+          },
+        ]);
+        if (hit) matched.push(item);
+      }
+    }
+    return matched;
+  }
+
   private async processRainClassroomAccount(
     account: StoredAccount,
     activeSlots: WatchSlot[],
+    activeGuards: RcLessonGuardRecord[],
     needPrefetch: boolean,
     nowMs: number
   ): Promise<void> {
-    const client = new RainClassroomClient(account, (cookies) => {
+    const client = this.rcClientFactory(account, (cookies) => {
       this.db.updateAccountCookies(account.accountKey, cookies);
     });
 
@@ -319,18 +512,21 @@ export class CloudSchedulerEngine {
         nowMs
       );
     }
-    if (!activeSlots.length) return;
+    if (!activeSlots.length && !activeGuards.length) return;
 
     // 协议要点：到点实时零缓存直查 getOnLesson
     const onLessons = await client.getOnLesson();
     if (!onLessons.length) return;
 
+    const handledLessonIds = new Set<string>();
+    const semesterStart =
+      account.semesterStartMonday || this.config.semesterStartMonday;
+
     for (const slot of activeSlots) {
       const boundCourseId = slot.reservation.boundOnlineCourseId?.trim() || null;
       const boundClassId = slot.reservation.boundOnlineClassId?.trim() || null;
 
-      let matchedLessonId: string | null = null;
-      let matchedCourseId: string | null = null;
+      let matchedItem: RcOnLessonItem | null = null;
 
       // 1. 精确绑定 ID 匹配
       if (boundCourseId) {
@@ -338,15 +534,14 @@ export class CloudSchedulerEngine {
           const courseMatch = item.courseId === boundCourseId;
           const classMatch = !boundClassId || item.classroomId === boundClassId;
           if (courseMatch && classMatch) {
-            matchedLessonId = item.lessonId;
-            matchedCourseId = item.courseId;
+            matchedItem = item;
             break;
           }
         }
       }
 
       // 2. 通过已选课反查绑定 ID 再匹配 onLessons
-      if (!matchedLessonId && enrolledCourses.length > 0) {
+      if (!matchedItem && enrolledCourses.length > 0) {
         const enrolledHit = fuzzyMatchOnlineCourse(
           slot.course.name,
           enrolledCourses
@@ -354,8 +549,7 @@ export class CloudSchedulerEngine {
         if (enrolledHit) {
           for (const item of onLessons) {
             if (item.courseId === enrolledHit.courseId) {
-              matchedLessonId = item.lessonId;
-              matchedCourseId = item.courseId;
+              matchedItem = item;
               break;
             }
           }
@@ -363,7 +557,7 @@ export class CloudSchedulerEngine {
       }
 
       // 3. 直接对实时 onLessons 课程名模糊匹配
-      if (!matchedLessonId) {
+      if (!matchedItem) {
         const liveCandidates: OnlineCourse[] = onLessons.map((item) => ({
           courseId: item.courseId,
           classId: item.classroomId,
@@ -375,15 +569,24 @@ export class CloudSchedulerEngine {
           slot.course.name,
           liveCandidates
         );
-        if (fuzzyHit) {
-          matchedCourseId = fuzzyHit.courseId;
-          matchedLessonId = fuzzyHit.lessonId ?? null;
+        if (fuzzyHit?.lessonId) {
+          matchedItem =
+            onLessons.find((i) => i.lessonId === fuzzyHit.lessonId) ?? null;
         }
       }
 
-      if (!matchedLessonId) continue;
+      if (!matchedItem) continue;
 
-      const targetCourseId = matchedCourseId ?? boundCourseId ?? '';
+      const matchedLessonId = matchedItem.lessonId;
+      const targetCourseId = matchedItem.courseId || boundCourseId || '';
+      const targetClassId = matchedItem.classroomId || boundClassId || '';
+      const guardKey = CloudDatabase.buildRcGuardKey(
+        targetCourseId,
+        targetClassId,
+        slot.course.name,
+        matchedLessonId
+      );
+      const existingGuard = activeGuards.find((g) => g.guardKey === guardKey);
       const alreadySigned = this.db.isReservationSigned(
         account.accountKey,
         slot.reservation.id,
@@ -391,100 +594,123 @@ export class CloudSchedulerEngine {
       );
 
       if (alreadySigned) {
-        // 连堂课下半场巡检：新开且未托管/未下课的 lessonId 自动二次进班续挂 AI
+        // 已签过该堂课：若已记录或正在监听/已下课则跳过；否则视为老师重开/连堂下半场，执行全闭环补签（含定位！）
         if (
+          existingGuard?.signedLessonIds.includes(matchedLessonId) ||
           this.rcAutoAnswer.isWatching(account.accountKey, matchedLessonId) ||
           this.rcAutoAnswer.isLessonFinished(account.accountKey, matchedLessonId)
         ) {
+          handledLessonIds.add(matchedLessonId);
           continue;
         }
-        const recheck = await client.checkIn(matchedLessonId);
-        if (recheck.code === 0) {
-          this.db.addLog({
-            accountKey: account.accountKey,
-            accountName: account.name,
-            platform: 'rainClassroom',
-            category: 'checkin',
-            level: 'success',
-            title: `连堂课自动续签进班《${slot.course.name}》`,
-            detail: `检测到下半场新课堂 (${matchedLessonId})，已自动进班续挂`,
-            courseName: slot.course.name,
-            lessonId: matchedLessonId,
-          });
-          await this.rcAutoAnswer.attachLesson({
-            account,
-            lessonId: matchedLessonId,
+
+        const outcome = await this.performRcCheckInAndLocation({
+          client,
+          account,
+          lessonId: matchedLessonId,
+          courseId: targetCourseId,
+          courseName: slot.course.name,
+          classroom: slot.course.classroom,
+          fallbackLocation: existingGuard?.lastLocation,
+        });
+        if (!outcome.ok || !outcome.checkRes) continue;
+
+        handledLessonIds.add(matchedLessonId);
+        const expireAtMs = Math.max(
+          slot.endEpochMs + 15 * 60 * 1000,
+          computeClassSessionGuardExpiryUtc8({
+            semesterStartMondayKey: semesterStart,
+            timetable: account.timetable,
+            reservations: account.reservations,
             courseId: targetCourseId,
+            classroomId: targetClassId,
             courseTitle: slot.course.name,
-            classroom: slot.course.classroom,
-            bearerToken: recheck.bearerToken,
-            lessonToken: recheck.lessonToken,
-          });
-        }
+            nowMs,
+          })
+        );
+        const ensured = this.db.upsertRcLessonGuard({
+          accountKey: account.accountKey,
+          lessonId: matchedLessonId,
+          courseId: targetCourseId,
+          classroomId: targetClassId,
+          courseTitle: slot.course.name,
+          classroom: slot.course.classroom,
+          lastLocation: outcome.usedLocation,
+          expireAtMs,
+          nowMs,
+        });
+        const nth = Math.max(2, ensured.guard.signedLessonIds.length);
+        this.db.addLog({
+          accountKey: account.accountKey,
+          accountName: account.name,
+          platform: 'rainClassroom',
+          category: 'reopen_checkin',
+          level: 'success',
+          title: `防试探自动补签成功《${slot.course.name}》`,
+          detail: `检测到本堂课重开新课堂（第 ${nth} 次，${matchedLessonId}），${outcome.signDetail} · 账号 ${account.name}`,
+          courseName: slot.course.name,
+          lessonId: matchedLessonId,
+        });
+        await this.rcAutoAnswer.attachLesson({
+          account,
+          lessonId: matchedLessonId,
+          courseId: targetCourseId,
+          courseTitle: slot.course.name,
+          classroom: slot.course.classroom,
+          bearerToken: outcome.checkRes.bearerToken,
+          lessonToken: outcome.checkRes.lessonToken,
+          watchOnly: !isAiReady(account.aiConfig),
+          guardLocationFallback:
+            outcome.usedLocation ?? existingGuard?.lastLocation ?? null,
+        });
         continue;
       }
 
-      // 首次进班签到（source: 21）
-      const checkRes = await client.checkIn(matchedLessonId);
-      if (checkRes.code !== 0) {
-        this.logger.warn(
-          'scheduler',
-          `雨课堂进班签到异常 code=${checkRes.code} course=${slot.course.name}`
-        );
-        continue;
-      }
+      // 首次进班签到（source: 21 + 按需自动定位 source: 27）
+      const outcome = await this.performRcCheckInAndLocation({
+        client,
+        account,
+        lessonId: matchedLessonId,
+        courseId: targetCourseId,
+        courseName: slot.course.name,
+        classroom: slot.course.classroom,
+        fallbackLocation: existingGuard?.lastLocation,
+      });
+      if (!outcome.ok || !outcome.checkRes) continue;
 
-      let signDetail = '云端免扫码进班签到成功';
-
-      // 检查是否需要定位签到（傻瓜式开箱全自动完成！）
-      if (checkRes.bearerToken) {
-        const eligibility = await client.getLocationCheckInEligibility(
-          checkRes.bearerToken
-        );
-        if (requiresPendingLocationSignIn(eligibility)) {
-          const preset = targetCourseId
-            ? account.courseLocations[targetCourseId] ?? null
-            : null;
-          const loc = resolveLocationForSignIn({
-            targetCoord: 'gcj02',
-            preset,
-            teacherLat: eligibility?.centerLat,
-            teacherLng: eligibility?.centerLng,
-            teacherAddress: eligibility?.address,
-            classroom: slot.course.classroom,
-          });
-          const submitRes = await client.submitLocationCheckIn(
-            checkRes.bearerToken,
-            matchedLessonId,
-            loc.latitude,
-            loc.longitude,
-            loc.address
-          );
-          if (Number(submitRes.code) === 0) {
-            signDetail = `云端自动定位签到成功 (${loc.address})`;
-          } else {
-            this.db.addLog({
-              accountKey: account.accountKey,
-              accountName: account.name,
-              platform: 'rainClassroom',
-              category: 'location',
-              level: 'warn',
-              title: `定位签到提交返回异常《${slot.course.name}》`,
-              detail: `地址：${loc.address}，返回：${JSON.stringify(submitRes).slice(0, 160)}`,
-              courseName: slot.course.name,
-              lessonId: matchedLessonId,
-            });
-            continue;
-          }
-        }
-      }
-
+      handledLessonIds.add(matchedLessonId);
       this.db.markReservationSigned(
         account.accountKey,
         slot.reservation.id,
         slot.dateKey,
-        signDetail
+        outcome.signDetail
       );
+
+      // 签到成功后立即建立本堂课防重开护航单（保至下课后 15 分钟）
+      const expireAtMs = Math.max(
+        slot.endEpochMs + 15 * 60 * 1000,
+        computeClassSessionGuardExpiryUtc8({
+          semesterStartMondayKey: semesterStart,
+          timetable: account.timetable,
+          reservations: account.reservations,
+          courseId: targetCourseId,
+          classroomId: targetClassId,
+          courseTitle: slot.course.name,
+          nowMs,
+        })
+      );
+      this.db.upsertRcLessonGuard({
+        accountKey: account.accountKey,
+        lessonId: matchedLessonId,
+        courseId: targetCourseId,
+        classroomId: targetClassId,
+        courseTitle: slot.course.name,
+        classroom: slot.course.classroom,
+        lastLocation: outcome.usedLocation,
+        expireAtMs,
+        nowMs,
+      });
+
       this.db.addLog({
         accountKey: account.accountKey,
         accountName: account.name,
@@ -492,21 +718,91 @@ export class CloudSchedulerEngine {
         category: 'checkin',
         level: 'success',
         title: `自动签到成功《${slot.course.name}》`,
-        detail: `${signDetail} · 账号 ${account.name}`,
+        detail: `${outcome.signDetail} · 账号 ${account.name}`,
         courseName: slot.course.name,
         lessonId: matchedLessonId,
       });
 
-      // 自动接管 AI 视觉答题（仅当该账号配置了 AI）
+      // 自动挂载 WS（开 AI 则答题+课中定位+下课感知；未开 AI 也轻量监听课中定位+下课秒级重检）
       await this.rcAutoAnswer.attachLesson({
         account,
         lessonId: matchedLessonId,
         courseId: targetCourseId,
         courseTitle: slot.course.name,
         classroom: slot.course.classroom,
-        bearerToken: checkRes.bearerToken,
-        lessonToken: checkRes.lessonToken,
+        bearerToken: outcome.checkRes.bearerToken,
+        lessonToken: outcome.checkRes.lessonToken,
+        watchOnly: !isAiReady(account.aiConfig),
+        guardLocationFallback: outcome.usedLocation,
       });
+    }
+
+    // 遍历全部生效中的「本堂课防试探护航单」（无论是否开启课表预约签到！）
+    const freshGuards = this.db.getActiveRcLessonGuards(
+      account.accountKey,
+      nowMs
+    );
+    for (const guard of freshGuards) {
+      const matchedItems = this.matchGuardLessonItems(guard, onLessons);
+      for (const item of matchedItems) {
+        if (
+          handledLessonIds.has(item.lessonId) ||
+          guard.signedLessonIds.includes(item.lessonId) ||
+          this.rcAutoAnswer.isWatching(account.accountKey, item.lessonId) ||
+          this.rcAutoAnswer.isLessonFinished(account.accountKey, item.lessonId)
+        ) {
+          continue;
+        }
+
+        const displayName = guard.courseTitle || item.courseName || '雨课堂课程';
+        const outcome = await this.performRcCheckInAndLocation({
+          client,
+          account,
+          lessonId: item.lessonId,
+          courseId: item.courseId || guard.courseId,
+          courseName: displayName,
+          classroom: guard.classroom,
+          fallbackLocation: guard.lastLocation,
+        });
+        if (!outcome.ok || !outcome.checkRes) continue;
+
+        handledLessonIds.add(item.lessonId);
+        const updatedGuard = this.db.recordRcGuardReopenSigned(
+          account.accountKey,
+          guard.guardKey,
+          item.lessonId,
+          outcome.usedLocation,
+          nowMs
+        );
+        const nth =
+          updatedGuard?.signedLessonIds.length ??
+          guard.signedLessonIds.length + 1;
+
+        this.db.addLog({
+          accountKey: account.accountKey,
+          accountName: account.name,
+          platform: 'rainClassroom',
+          category: 'reopen_checkin',
+          level: 'success',
+          title: `防试探自动补签成功《${displayName}》`,
+          detail: `检测到本堂课重开新课堂（第 ${nth} 次，${item.lessonId}），${outcome.signDetail} · 账号 ${account.name}`,
+          courseName: displayName,
+          lessonId: item.lessonId,
+        });
+
+        await this.rcAutoAnswer.attachLesson({
+          account,
+          lessonId: item.lessonId,
+          courseId: item.courseId || guard.courseId,
+          courseTitle: displayName,
+          classroom: guard.classroom,
+          bearerToken: outcome.checkRes.bearerToken,
+          lessonToken: outcome.checkRes.lessonToken,
+          watchOnly: !isAiReady(account.aiConfig),
+          guardLocationFallback:
+            outcome.usedLocation ?? guard.lastLocation ?? null,
+        });
+      }
     }
   }
 

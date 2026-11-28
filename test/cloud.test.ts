@@ -32,6 +32,7 @@ import {
 import { createCloudServer } from '../src/server.js';
 import {
   academicWeekForEpoch,
+  computeClassSessionGuardExpiryUtc8,
   computeSlotEpochsUtc8,
   defaultWatchWindowForCourse,
   getUtc8Parts,
@@ -968,6 +969,380 @@ describe('Multi-device v2 sync, ownership security, migration & legacy compat', 
         assert.deepEqual(p2.stoppedAccountKeys, ['rc:yuketang_10001']);
         assert.equal(db.getAccount('rc:yuketang_10001'), null);
       } finally {
+        db.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('RainClassroom same-class reopen guard (防试探重签护航)', () => {
+  it('computes class session guard expiry: timetable first, big-section fallback, 120m non-standard, never cross-day', () => {
+    const startMonday = '2026-09-07';
+    const course910: TimetableCourse = {
+      id: 'c910',
+      name: '飞行动力学',
+      teacher: '李老师',
+      classroom: '一教201',
+      weekday: 3,
+      startSection: 9,
+      endSection: 10,
+      weeks: [1, 2, 3],
+    };
+
+    // 1. 匹配课表 9-10 节 (20:40 下课 + 15m = 20:55)
+    const wed1905 = utc8EpochMs(2026, 9, 16, 19, 5, 0);
+    const expTimetable = computeClassSessionGuardExpiryUtc8({
+      semesterStartMondayKey: startMonday,
+      timetable: [course910],
+      courseTitle: '飞行动力学',
+      nowMs: wed1905,
+    });
+    const p1 = getUtc8Parts(expTimetable);
+    assert.equal(p1.dateKey, '2026-09-16');
+    assert.equal(p1.hour, 20);
+    assert.equal(p1.minute, 55);
+
+    // 2. 未导课表但在 5-6 标准大节 (14:05 -> 15:55)
+    const wed1405 = utc8EpochMs(2026, 9, 16, 14, 5, 0);
+    const expFallback = computeClassSessionGuardExpiryUtc8({
+      semesterStartMondayKey: startMonday,
+      timetable: [],
+      courseTitle: '临时选修课',
+      nowMs: wed1405,
+    });
+    const p2 = getUtc8Parts(expFallback);
+    assert.equal(p2.dateKey, '2026-09-16');
+    assert.equal(p2.hour, 15);
+    assert.equal(p2.minute, 55);
+
+    // 3. 非标准时段 (12:30 -> +120m = 14:30)
+    const wed1230 = utc8EpochMs(2026, 9, 16, 12, 30, 0);
+    const expNonStd = computeClassSessionGuardExpiryUtc8({
+      semesterStartMondayKey: startMonday,
+      timetable: [],
+      courseTitle: '午间讲座',
+      nowMs: wed1230,
+    });
+    const p3 = getUtc8Parts(expNonStd);
+    assert.equal(p3.hour, 14);
+    assert.equal(p3.minute, 30);
+
+    // 4. 绝不跨天 (23:30 -> 当日 23:59:59)
+    const wed2330 = utc8EpochMs(2026, 9, 16, 23, 30, 0);
+    const expLate = computeClassSessionGuardExpiryUtc8({
+      semesterStartMondayKey: startMonday,
+      timetable: [],
+      courseTitle: '深夜测试',
+      nowMs: wed2330,
+    });
+    const p4 = getUtc8Parts(expLate);
+    assert.equal(p4.dateKey, '2026-09-16');
+    assert.equal(p4.hour, 23);
+    assert.equal(p4.minute, 59);
+  });
+
+  it('auto re-signs reopened RC lessons multiple times (normal + location) without reservations and stops after class ends', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-guard-sched-'));
+    try {
+      const cfg = loadConfig({
+        DATA_DIR: tmpDir,
+        ACCESS_CODE: 'guard-test-code',
+        ENCRYPTION_KEY: 'guard-test-encryption-key-32-bytes!',
+      });
+      const logger = new Logger('error');
+      const db = new CloudDatabase({
+        dataDir: cfg.dataDir,
+        encryptionKey: cfg.encryptionKey,
+      });
+      const rcAutoAnswer = new RcAutoAnswerEngine(db, logger);
+      // 阻止测试期间发起真实外部 WebSocket 连接
+      rcAutoAnswer.attachLesson = async () => {};
+
+      let activeLessons = [
+        {
+          lessonId: 'L2',
+          courseId: '9001',
+          classroomId: '8001',
+          courseName: '飞行动力学',
+        },
+      ];
+      let requireLocationForLesson: Record<string, boolean> = {};
+      const checkedInIds: string[] = [];
+      const locationSubmitted: Array<{
+        lessonId: string;
+        lat: number;
+        lng: number;
+        address: string;
+      }> = [];
+
+      const scheduler = new CloudSchedulerEngine(
+        cfg,
+        db,
+        rcAutoAnswer,
+        logger,
+        () => ({
+          async getAllEnrolledCourses() {
+            return [];
+          },
+          async getOnLesson() {
+            return activeLessons;
+          },
+          async checkIn(lessonId: string) {
+            checkedInIds.push(lessonId);
+            return {
+              code: 0,
+              bearerToken: `bt_${lessonId}`,
+              lessonToken: `lt_${lessonId}`,
+            };
+          },
+          async getLocationCheckInEligibility(bearerToken: string) {
+            const lid = bearerToken.replace(/^bt_/, '');
+            if (requireLocationForLesson[lid]) {
+              return {
+                code: 0,
+                msg: 'ok',
+                needLocationSignIn: true,
+                signed: false,
+                canSign: true,
+                centerLat: 22.051,
+                centerLng: 113.401,
+                radius: 100,
+                address: '老师定位点',
+                raw: {},
+              };
+            }
+            return {
+              code: 0,
+              msg: 'ok',
+              needLocationSignIn: false,
+              signed: true,
+              canSign: false,
+              centerLat: null,
+              centerLng: null,
+              radius: null,
+              address: null,
+              raw: {},
+            };
+          },
+          async submitLocationCheckIn(
+            _bearerToken: string,
+            lessonId: string,
+            lat: number,
+            lng: number,
+            address: string
+          ) {
+            locationSubmitted.push({ lessonId, lat, lng, address });
+            return { code: 0 };
+          },
+        })
+      );
+
+      try {
+        // 创建未开启任何预约签到的雨课堂账号（reservations = []）
+        db.seedNewAccount({
+          accountKey: 'rc:changjiang_53306792',
+          platform: 'rainClassroom',
+          server: 'changjiang',
+          uid: '53306792',
+          name: '钟淏名',
+          cookies: { sessionid: 'sess_valid_12345678' },
+          config: { timetable: [], reservations: [] },
+          device: { deviceId: 'dev_phone_12345678' },
+        });
+
+        // 模拟用户手动扫码签到了 L1，并留下首次定位坐标
+        const nowMs = Date.now();
+        db.upsertRcLessonGuard({
+          accountKey: 'rc:changjiang_53306792',
+          lessonId: 'L1',
+          courseId: '9001',
+          classroomId: '8001',
+          courseTitle: '飞行动力学',
+          classroom: '一教201',
+          lastLocation: {
+            address: '一教201手动选点',
+            latitude: 22.04935,
+            longitude: 113.40065,
+          },
+          expireAtMs: nowMs + 60 * 60 * 1000,
+          nowMs,
+        });
+
+        // 场景 1：老师关掉 L1 重开 L2（普通签到）-> 应自动补签 L2
+        await scheduler.tick();
+        assert.deepEqual(checkedInIds, ['L2']);
+        assert.equal(locationSubmitted.length, 0);
+
+        // 同一 L2 再次轮询不得重复签到
+        await scheduler.tick();
+        assert.deepEqual(checkedInIds, ['L2']);
+
+        // 场景 2：老师再关 L2 重开 L3 并加开定位签到 -> 自动免扫码进班 + 复用位置提交定位
+        activeLessons = [
+          {
+            lessonId: 'L3',
+            courseId: '9001',
+            classroomId: '8001',
+            courseName: '飞行动力学',
+          },
+        ];
+        requireLocationForLesson = { L3: true };
+        await scheduler.tick();
+        assert.deepEqual(checkedInIds, ['L2', 'L3']);
+        assert.equal(locationSubmitted.length, 1);
+        assert.equal(locationSubmitted[0].lessonId, 'L3');
+        assert.equal(locationSubmitted[0].address, '一教201手动选点');
+
+        // 校验护航单状态与防试探日志
+        const guards = db.getActiveRcLessonGuards('rc:changjiang_53306792');
+        assert.equal(guards.length, 1);
+        assert.deepEqual(guards[0].signedLessonIds, ['L1', 'L2', 'L3']);
+        assert.equal(guards[0].reopenCount, 2);
+
+        const logs = db.getLogsForAccounts(['rc:changjiang_53306792']);
+        const reopenLogs = logs.filter((l) => l.category === 'reopen_checkin');
+        assert.equal(reopenLogs.length, 2);
+        assert.ok(reopenLogs[0].detail.includes('第 3 次'));
+        assert.ok(reopenLogs[1].detail.includes('第 2 次'));
+
+        // 场景 3：下课过期后（模拟几天后同一课程再开 L4）-> 绝不自动乱签
+        db.pruneExpiredRcLessonGuards(nowMs + 2 * 60 * 60 * 1000);
+        assert.equal(db.getActiveRcLessonGuards('rc:changjiang_53306792').length, 0);
+        activeLessons = [
+          {
+            lessonId: 'L4',
+            courseId: '9001',
+            classroomId: '8001',
+            courseName: '飞行动力学',
+          },
+        ];
+        await scheduler.tick();
+        assert.deepEqual(checkedInIds, ['L2', 'L3']);
+      } finally {
+        scheduler.stop();
+        rcAutoAnswer.shutdown();
+        db.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('HTTP POST /api/v2/accounts/:accountKey/rc-lesson-guard validates binding and exposes activeGuards', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-guard-http-'));
+    try {
+      const cfg = loadConfig({
+        DATA_DIR: tmpDir,
+        ACCESS_CODE: 'guard-http-code',
+        ENCRYPTION_KEY: 'guard-http-encryption-key-32-bytes!',
+      });
+      const logger = new Logger('error');
+      const db = new CloudDatabase({
+        dataDir: cfg.dataDir,
+        encryptionKey: cfg.encryptionKey,
+      });
+      const rcAutoAnswer = new RcAutoAnswerEngine(db, logger);
+      rcAutoAnswer.attachLesson = async () => {};
+      const scheduler = new CloudSchedulerEngine(cfg, db, rcAutoAnswer, logger);
+      scheduler.onWorkspaceUpdated = () => {};
+
+      const server = createCloudServer({
+        config: cfg,
+        db,
+        rcAutoAnswer,
+        scheduler,
+        logger,
+        ownershipVerifier: async () => ({ ok: true }),
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      assert.ok(addr && typeof addr === 'object');
+      const base = `http://127.0.0.1:${addr.port}`;
+
+      try {
+        db.seedNewAccount({
+          accountKey: 'rc:changjiang_53306792',
+          platform: 'rainClassroom',
+          server: 'changjiang',
+          uid: '53306792',
+          name: '钟淏名',
+          cookies: { sessionid: 'sess_http_12345678' },
+          config: { timetable: [], reservations: [] },
+          device: { deviceId: 'dev_bound_12345678' },
+        });
+
+        // 未绑定设备被拒 (403)
+        const r403 = await fetch(
+          `${base}/api/v2/accounts/${encodeURIComponent('rc:changjiang_53306792')}/rc-lesson-guard`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Access-Code': 'guard-http-code',
+              'X-Device-Id': 'dev_stranger_99999',
+            },
+            body: JSON.stringify({
+              lessonId: 'L100',
+              courseId: 'C100',
+              classroomId: 'CLS100',
+              courseTitle: '概率论',
+            }),
+          }
+        );
+        assert.equal(r403.status, 403);
+
+        // 已绑定设备成功上报护航单 (200)
+        const r200 = await fetch(
+          `${base}/api/v2/accounts/${encodeURIComponent('rc:changjiang_53306792')}/rc-lesson-guard`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Access-Code': 'guard-http-code',
+              'X-Device-Id': 'dev_bound_12345678',
+            },
+            body: JSON.stringify({
+              lessonId: 'L100',
+              courseId: 'C100',
+              classroomId: 'CLS100',
+              courseTitle: '概率论',
+            }),
+          }
+        );
+        assert.equal(r200.status, 200);
+        const body200 = (await r200.json()) as {
+          ok: boolean;
+          created: boolean;
+          guard: { signedLessonIds: string[]; courseTitle: string };
+        };
+        assert.equal(body200.ok, true);
+        assert.equal(body200.created, true);
+        assert.deepEqual(body200.guard.signedLessonIds, ['L100']);
+
+        // /health 暴露 capabilities 包含 rc_lesson_guard
+        const rHealth = await fetch(`${base}/health`);
+        const health = (await rHealth.json()) as { capabilities?: string[] };
+        assert.ok(health.capabilities?.includes('rc_lesson_guard'));
+
+        // /api/status 返回 activeGuards
+        const rStatus = await fetch(`${base}/api/status`, {
+          headers: {
+            'X-Access-Code': 'guard-http-code',
+            'X-Device-Id': 'dev_bound_12345678',
+          },
+        });
+        const statusJson = (await rStatus.json()) as {
+          activeGuards?: Array<{ courseId: string }>;
+        };
+        assert.equal(statusJson.activeGuards?.length, 1);
+        assert.equal(statusJson.activeGuards?.[0].courseId, 'C100');
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        scheduler.stop();
+        rcAutoAnswer.shutdown();
         db.close();
       }
     } finally {

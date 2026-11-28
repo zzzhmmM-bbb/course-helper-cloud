@@ -176,10 +176,42 @@ export interface StoredAccount {
 export type LogCategory =
   | 'sync'
   | 'checkin'
+  | 'reopen_checkin'
   | 'location'
   | 'ai_answer'
   | 'session'
   | 'system';
+
+export interface RcLessonGuardLocation {
+  address: string;
+  latitude: number;
+  longitude: number;
+}
+
+export interface RcLessonGuardRecord {
+  accountKey: string;
+  guardKey: string;
+  courseId: string;
+  classroomId: string;
+  courseTitle: string;
+  classroom: string;
+  signedLessonIds: string[];
+  reopenCount: number;
+  lastLocation: RcLessonGuardLocation | null;
+  expireAtMs: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReportRcLessonGuardRequest {
+  lessonId: string;
+  courseId?: string | null;
+  classroomId?: string | null;
+  courseTitle?: string | null;
+  classroom?: string | null;
+  expireAtMs?: number | null;
+  lastLocation?: RcLessonGuardLocation | null;
+}
 
 export type LogSeverity = 'info' | 'success' | 'warn' | 'error';
 

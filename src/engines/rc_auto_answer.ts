@@ -19,6 +19,7 @@ import {
   type PresentationData,
   type PresentationSlide,
   type ProblemData,
+  type RcLessonGuardLocation,
   type StoredAccount,
 } from '../types.js';
 
@@ -32,6 +33,8 @@ interface InternalLessonSession {
   classroom: string;
   bearerToken: string | null;
   lessonToken: string | null;
+  watchOnly: boolean;
+  guardLocationFallback: RcLessonGuardLocation | null;
   ws: WebSocket | null;
   isConnected: boolean;
   paused: boolean;
@@ -71,11 +74,20 @@ function asInt(v: unknown): number | null {
 export class RcAutoAnswerEngine {
   private readonly sessions = new Map<string, InternalLessonSession>();
   private readonly finishedKeys = new Set<string>();
+  private onLessonFinishedCallback:
+    | ((accountKey: string, lessonId: string, courseId: string) => void)
+    | null = null;
 
   constructor(
     private readonly db: CloudDatabase,
     private readonly logger: Logger
   ) {}
+
+  setOnLessonFinished(
+    cb: ((accountKey: string, lessonId: string, courseId: string) => void) | null
+  ): void {
+    this.onLessonFinishedCallback = cb;
+  }
 
   static buildSessionKey(accountKey: string, lessonId: string): string {
     return `${accountKey}::${lessonId}`;
@@ -96,7 +108,7 @@ export class RcAutoAnswerEngine {
   getActiveCount(): number {
     let count = 0;
     for (const s of this.sessions.values()) {
-      if (!s.disposed && !s.isFinished) count++;
+      if (!s.disposed && !s.isFinished && !s.watchOnly) count++;
     }
     return count;
   }
@@ -105,7 +117,9 @@ export class RcAutoAnswerEngine {
     const keySet = new Set(accountKeys);
     const out: ActiveSessionSnapshot[] = [];
     for (const s of this.sessions.values()) {
-      if (!keySet.has(s.accountKey) || s.disposed || s.isFinished) continue;
+      if (!keySet.has(s.accountKey) || s.disposed || s.isFinished || s.watchOnly) {
+        continue;
+      }
       out.push({
         sessionKey: s.sessionKey,
         accountKey: s.accountKey,
@@ -197,9 +211,13 @@ export class RcAutoAnswerEngine {
     classroom?: string;
     bearerToken?: string | null;
     lessonToken?: string | null;
+    watchOnly?: boolean;
+    guardLocationFallback?: RcLessonGuardLocation | null;
   }): Promise<void> {
     const { account, lessonId } = params;
-    if (!isAiReady(account.aiConfig)) return;
+    const aiReady = isAiReady(account.aiConfig);
+    const watchOnly = params.watchOnly ?? !aiReady;
+    if (!aiReady && !watchOnly) return;
     if (!lessonId) return;
 
     const sessionKey = RcAutoAnswerEngine.buildSessionKey(
@@ -215,6 +233,12 @@ export class RcAutoAnswerEngine {
       if (params.courseTitle?.trim()) {
         existing.courseTitle = params.courseTitle.trim();
       }
+      if (params.guardLocationFallback) {
+        existing.guardLocationFallback = params.guardLocationFallback;
+      }
+      if (existing.watchOnly && aiReady && !watchOnly) {
+        existing.watchOnly = false;
+      }
       return;
     }
 
@@ -229,6 +253,8 @@ export class RcAutoAnswerEngine {
       classroom: params.classroom ?? '',
       bearerToken: params.bearerToken ?? null,
       lessonToken: params.lessonToken ?? null,
+      watchOnly,
+      guardLocationFallback: params.guardLocationFallback ?? null,
       ws: null,
       isConnected: false,
       paused: false,
@@ -250,17 +276,19 @@ export class RcAutoAnswerEngine {
     };
 
     this.sessions.set(sessionKey, session);
-    this.db.addLog({
-      accountKey: account.accountKey,
-      accountName: account.name,
-      platform: 'rainClassroom',
-      category: 'session',
-      level: 'info',
-      title: `已开启云端 AI 课堂托管《${session.courseTitle}》`,
-      detail: `账号 ${account.name} 已挂载课堂 WebSocket 监听 (${lessonId})`,
-      courseName: session.courseTitle,
-      lessonId,
-    });
+    if (!watchOnly) {
+      this.db.addLog({
+        accountKey: account.accountKey,
+        accountName: account.name,
+        platform: 'rainClassroom',
+        category: 'session',
+        level: 'info',
+        title: `已开启云端 AI 课堂托管《${session.courseTitle}》`,
+        detail: `账号 ${account.name} 已挂载课堂 WebSocket 监听 (${lessonId})`,
+        courseName: session.courseTitle,
+        lessonId,
+      });
+    }
 
     await this.connectSession(session);
   }
@@ -518,9 +546,18 @@ export class RcAutoAnswerEngine {
       );
       if (!requiresPendingLocationSignIn(eligibility)) return;
 
-      const preset = session.courseId
-        ? account.courseLocations[session.courseId] ?? null
-        : null;
+      const preset =
+        (session.courseId
+          ? account.courseLocations[session.courseId] ?? null
+          : null) ??
+        (session.guardLocationFallback
+          ? {
+              address: session.guardLocationFallback.address,
+              latitude: session.guardLocationFallback.latitude,
+              longitude: session.guardLocationFallback.longitude,
+              coordType: 'gcj02' as const,
+            }
+          : null);
       const loc = resolveLocationForSignIn({
         targetCoord: 'gcj02',
         preset,
@@ -593,7 +630,8 @@ export class RcAutoAnswerEngine {
     if (historicalProblems.length === 0) return;
 
     const account = this.getFreshAccount(session);
-    const allowRetryExpired = Boolean(account?.aiConfig?.autoRetryExpired);
+    if (session.watchOnly || !account || !isAiReady(account.aiConfig)) return;
+    const allowRetryExpired = Boolean(account.aiConfig?.autoRetryExpired);
     const nowMs = Date.now();
 
     for (const ev of historicalProblems) {
@@ -942,19 +980,26 @@ export class RcAutoAnswerEngine {
     if (session.isFinished) return;
     session.isFinished = true;
     this.finishedKeys.add(session.sessionKey);
-    this.db.addLog({
-      accountKey: session.accountKey,
-      accountName: session.accountName,
-      platform: 'rainClassroom',
-      category: 'session',
-      level: 'info',
-      title: `已下课，结束云端托管《${session.courseTitle}》`,
-      detail: `本堂课 AI 共自动完成 ${session.solvedCount} 道题`,
-      courseName: session.courseTitle,
-      lessonId: session.lessonId,
-    });
+    if (!session.watchOnly) {
+      this.db.addLog({
+        accountKey: session.accountKey,
+        accountName: session.accountName,
+        platform: 'rainClassroom',
+        category: 'session',
+        level: 'info',
+        title: `已下课，结束云端托管《${session.courseTitle}》`,
+        detail: `本堂课 AI 共自动完成 ${session.solvedCount} 道题`,
+        courseName: session.courseTitle,
+        lessonId: session.lessonId,
+      });
+    }
     this.disposeSession(session);
     this.sessions.delete(session.sessionKey);
+    this.onLessonFinishedCallback?.(
+      session.accountKey,
+      session.lessonId,
+      session.courseId
+    );
   }
 
   private disposeSession(session: InternalLessonSession): void {

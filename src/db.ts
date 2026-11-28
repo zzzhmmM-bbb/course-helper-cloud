@@ -15,6 +15,8 @@ import type {
   LogSeverity,
   PlatformType,
   RainClassroomServerType,
+  RcLessonGuardLocation,
+  RcLessonGuardRecord,
   SignReservation,
   StoredAccount,
   TimetableCourse,
@@ -182,6 +184,23 @@ export class CloudDatabase {
         problem_id TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS rc_lesson_guards${prefix} (
+        account_key TEXT NOT NULL,
+        guard_key TEXT NOT NULL,
+        course_id TEXT NOT NULL DEFAULT '',
+        classroom_id TEXT NOT NULL DEFAULT '',
+        course_title TEXT NOT NULL DEFAULT '',
+        classroom TEXT NOT NULL DEFAULT '',
+        signed_lesson_ids_json TEXT NOT NULL DEFAULT '[]',
+        reopen_count INTEGER NOT NULL DEFAULT 0,
+        last_location_json TEXT,
+        expire_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_key, guard_key),
+        FOREIGN KEY (account_key) REFERENCES ${tAccounts}(account_key) ON DELETE CASCADE
+      );
     `);
   }
 
@@ -193,6 +212,8 @@ export class CloudDatabase {
         ON account_devices (device_id, account_key);
       CREATE INDEX IF NOT EXISTS idx_devices_last_seen
         ON account_devices (last_seen_ms);
+      CREATE INDEX IF NOT EXISTS idx_rc_guards_expire
+        ON rc_lesson_guards (expire_at_ms);
     `);
   }
 
@@ -256,6 +277,7 @@ export class CloudDatabase {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.exec(`
+        DROP TABLE IF EXISTS rc_lesson_guards_v2;
         DROP TABLE IF EXISTS execution_logs_v2;
         DROP TABLE IF EXISTS answered_problems_v2;
         DROP TABLE IF EXISTS signed_records_v2;
@@ -411,6 +433,7 @@ export class CloudDatabase {
       }
 
       this.db.exec(`
+        DROP TABLE IF EXISTS rc_lesson_guards;
         DROP TABLE IF EXISTS execution_logs;
         DROP TABLE IF EXISTS answered_problems;
         DROP TABLE IF EXISTS signed_records;
@@ -422,6 +445,7 @@ export class CloudDatabase {
         ALTER TABLE signed_records_v2 RENAME TO signed_records;
         ALTER TABLE answered_problems_v2 RENAME TO answered_problems;
         ALTER TABLE execution_logs_v2 RENAME TO execution_logs;
+        ALTER TABLE rc_lesson_guards_v2 RENAME TO rc_lesson_guards;
       `);
 
       this.createIndexes();
@@ -1110,6 +1134,9 @@ export class CloudDatabase {
       .prepare('DELETE FROM answered_problems WHERE account_key = ?')
       .run(accountKey);
     this.db
+      .prepare('DELETE FROM rc_lesson_guards WHERE account_key = ?')
+      .run(accountKey);
+    this.db
       .prepare('DELETE FROM execution_logs WHERE account_key = ?')
       .run(accountKey);
     return Number(info.changes) > 0;
@@ -1399,6 +1426,307 @@ export class CloudDatabase {
       problemId: String(r.problem_id ?? ''),
       createdAt: String(r.created_at),
     }));
+  }
+
+  private deserializeRcLessonGuard(
+    row: Record<string, unknown>
+  ): RcLessonGuardRecord {
+    let signedLessonIds: string[] = [];
+    try {
+      const parsed = JSON.parse(String(row.signed_lesson_ids_json ?? '[]'));
+      if (Array.isArray(parsed)) {
+        signedLessonIds = parsed
+          .map((x) => String(x ?? '').trim())
+          .filter(Boolean);
+      }
+    } catch {
+      signedLessonIds = [];
+    }
+
+    let lastLocation: RcLessonGuardLocation | null = null;
+    if (typeof row.last_location_json === 'string' && row.last_location_json) {
+      try {
+        const loc = JSON.parse(row.last_location_json) as Record<string, unknown>;
+        const lat = Number(loc.latitude);
+        const lng = Number(loc.longitude);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          lastLocation = {
+            address: String(loc.address ?? ''),
+            latitude: lat,
+            longitude: lng,
+          };
+        }
+      } catch {
+        lastLocation = null;
+      }
+    }
+
+    return {
+      accountKey: String(row.account_key),
+      guardKey: String(row.guard_key),
+      courseId: String(row.course_id ?? ''),
+      classroomId: String(row.classroom_id ?? ''),
+      courseTitle: String(row.course_title ?? ''),
+      classroom: String(row.classroom ?? ''),
+      signedLessonIds,
+      reopenCount: Number(row.reopen_count ?? 0),
+      lastLocation,
+      expireAtMs: Number(row.expire_at_ms ?? 0),
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+    };
+  }
+
+  static buildRcGuardKey(
+    courseId: string,
+    classroomId: string,
+    courseTitle: string,
+    fallbackLessonId: string
+  ): string {
+    const cid = courseId.trim();
+    const clsid = classroomId.trim();
+    if (cid && clsid) return `${cid}_${clsid}`;
+    if (cid) return cid;
+    if (clsid) return `cls_${clsid}`;
+    const title = courseTitle.trim();
+    if (title) return `title_${title}`;
+    return `lesson_${fallbackLessonId.trim()}`;
+  }
+
+  upsertRcLessonGuard(params: {
+    accountKey: string;
+    lessonId: string;
+    courseId?: string;
+    classroomId?: string;
+    courseTitle?: string;
+    classroom?: string;
+    lastLocation?: RcLessonGuardLocation | null;
+    expireAtMs: number;
+    nowMs?: number;
+  }): { guard: RcLessonGuardRecord; created: boolean } {
+    const nowMs = params.nowMs ?? Date.now();
+    const nowIso = formatUtc8Iso(nowMs);
+    const courseId = (params.courseId ?? '').trim();
+    const classroomId = (params.classroomId ?? '').trim();
+    const courseTitle = (params.courseTitle ?? '').trim();
+    const classroom = (params.classroom ?? '').trim();
+    const lessonId = params.lessonId.trim();
+    const guardKey = CloudDatabase.buildRcGuardKey(
+      courseId,
+      classroomId,
+      courseTitle,
+      lessonId
+    );
+    const clampedExpireMs = Math.min(
+      Math.max(params.expireAtMs, nowMs + 10 * 60 * 1000),
+      nowMs + 4 * 60 * 60 * 1000
+    );
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existingRow = this.db
+        .prepare(
+          `SELECT * FROM rc_lesson_guards
+           WHERE account_key = ? AND guard_key = ?`
+        )
+        .get(params.accountKey, guardKey) as Record<string, unknown> | undefined;
+
+      if (existingRow) {
+        const prev = this.deserializeRcLessonGuard(existingRow);
+        const isExpiredPrev = prev.expireAtMs < nowMs;
+        const mergedLessonIds = isExpiredPrev ? [] : [...prev.signedLessonIds];
+        if (lessonId && !mergedLessonIds.includes(lessonId)) {
+          mergedLessonIds.push(lessonId);
+        }
+        const nextLocation =
+          params.lastLocation ?? (isExpiredPrev ? null : prev.lastLocation);
+        const nextExpire = isExpiredPrev
+          ? clampedExpireMs
+          : Math.max(prev.expireAtMs, clampedExpireMs);
+        const nextReopen = isExpiredPrev ? 0 : prev.reopenCount;
+        const nextCreatedAt = isExpiredPrev ? nowIso : prev.createdAt;
+
+        this.db
+          .prepare(
+            `UPDATE rc_lesson_guards SET
+              course_id = ?,
+              classroom_id = ?,
+              course_title = ?,
+              classroom = ?,
+              signed_lesson_ids_json = ?,
+              reopen_count = ?,
+              last_location_json = ?,
+              expire_at_ms = ?,
+              created_at = ?,
+              updated_at = ?
+             WHERE account_key = ? AND guard_key = ?`
+          )
+          .run(
+            courseId || prev.courseId,
+            classroomId || prev.classroomId,
+            courseTitle || prev.courseTitle,
+            classroom || prev.classroom,
+            JSON.stringify(mergedLessonIds),
+            nextReopen,
+            nextLocation ? JSON.stringify(nextLocation) : null,
+            nextExpire,
+            nextCreatedAt,
+            nowIso,
+            params.accountKey,
+            guardKey
+          );
+
+        const fresh = this.db
+          .prepare(
+            `SELECT * FROM rc_lesson_guards
+             WHERE account_key = ? AND guard_key = ?`
+          )
+          .get(params.accountKey, guardKey) as Record<string, unknown>;
+        this.db.exec('COMMIT');
+        return {
+          guard: this.deserializeRcLessonGuard(fresh),
+          created: isExpiredPrev,
+        };
+      }
+
+      const initialLessons = lessonId ? [lessonId] : [];
+      this.db
+        .prepare(
+          `INSERT INTO rc_lesson_guards (
+            account_key, guard_key, course_id, classroom_id,
+            course_title, classroom, signed_lesson_ids_json,
+            reopen_count, last_location_json, expire_at_ms,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`
+        )
+        .run(
+          params.accountKey,
+          guardKey,
+          courseId,
+          classroomId,
+          courseTitle,
+          classroom,
+          JSON.stringify(initialLessons),
+          params.lastLocation ? JSON.stringify(params.lastLocation) : null,
+          clampedExpireMs,
+          nowIso,
+          nowIso
+        );
+
+      const inserted = this.db
+        .prepare(
+          `SELECT * FROM rc_lesson_guards
+           WHERE account_key = ? AND guard_key = ?`
+        )
+        .get(params.accountKey, guardKey) as Record<string, unknown>;
+      this.db.exec('COMMIT');
+      return {
+        guard: this.deserializeRcLessonGuard(inserted),
+        created: true,
+      };
+    } catch (err) {
+      this.safeRollback();
+      throw err;
+    }
+  }
+
+  recordRcGuardReopenSigned(
+    accountKey: string,
+    guardKey: string,
+    lessonId: string,
+    lastLocation?: RcLessonGuardLocation | null,
+    nowMs = Date.now()
+  ): RcLessonGuardRecord | null {
+    const lid = lessonId.trim();
+    if (!lid) return null;
+    const nowIso = formatUtc8Iso(nowMs);
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT * FROM rc_lesson_guards
+           WHERE account_key = ? AND guard_key = ?`
+        )
+        .get(accountKey, guardKey) as Record<string, unknown> | undefined;
+      if (!row) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const prev = this.deserializeRcLessonGuard(row);
+      const ids = [...prev.signedLessonIds];
+      const isNew = !ids.includes(lid);
+      if (isNew) ids.push(lid);
+      const nextReopen = isNew ? prev.reopenCount + 1 : prev.reopenCount;
+      const nextLoc = lastLocation ?? prev.lastLocation;
+
+      this.db
+        .prepare(
+          `UPDATE rc_lesson_guards SET
+            signed_lesson_ids_json = ?,
+            reopen_count = ?,
+            last_location_json = ?,
+            updated_at = ?
+           WHERE account_key = ? AND guard_key = ?`
+        )
+        .run(
+          JSON.stringify(ids),
+          nextReopen,
+          nextLoc ? JSON.stringify(nextLoc) : null,
+          nowIso,
+          accountKey,
+          guardKey
+        );
+
+      const fresh = this.db
+        .prepare(
+          `SELECT * FROM rc_lesson_guards
+           WHERE account_key = ? AND guard_key = ?`
+        )
+        .get(accountKey, guardKey) as Record<string, unknown>;
+      this.db.exec('COMMIT');
+      return this.deserializeRcLessonGuard(fresh);
+    } catch (err) {
+      this.safeRollback();
+      throw err;
+    }
+  }
+
+  getActiveRcLessonGuards(
+    accountKey: string,
+    nowMs = Date.now()
+  ): RcLessonGuardRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM rc_lesson_guards
+         WHERE account_key = ? AND expire_at_ms >= ?
+         ORDER BY updated_at DESC`
+      )
+      .all(accountKey, nowMs) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.deserializeRcLessonGuard(r));
+  }
+
+  getActiveRcLessonGuardsForAccounts(
+    accountKeys: string[],
+    nowMs = Date.now()
+  ): RcLessonGuardRecord[] {
+    if (accountKeys.length === 0) return [];
+    const placeholders = accountKeys.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM rc_lesson_guards
+         WHERE account_key IN (${placeholders}) AND expire_at_ms >= ?
+         ORDER BY updated_at DESC`
+      )
+      .all(...accountKeys, nowMs) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.deserializeRcLessonGuard(r));
+  }
+
+  pruneExpiredRcLessonGuards(nowMs = Date.now()): number {
+    const res = this.db
+      .prepare('DELETE FROM rc_lesson_guards WHERE expire_at_ms < ?')
+      .run(nowMs);
+    return Number(res.changes);
   }
 
   getStats(): { workspaces: number; accounts: number; devices: number } {
